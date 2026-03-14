@@ -1,0 +1,11 @@
+def main() -> int:
+    let t: bool = true;
+    let f: bool = false;
+    
+    if t and not f:
+        if f or t:
+            return 1;
+        else:
+            return 0;
+    else:
+        return 2;

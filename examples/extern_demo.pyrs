@@ -1,0 +1,10 @@
+extern def puts(s: str) -> int;
+extern def printf(s: str, n: int) -> int;
+
+def main() -> int:
+    puts("Demonstrating extern functions...");
+    let result: int = 42;
+    // Note: printf with multiple args works if semantic analysis allows it.
+    // Our current semantic analysis allows it if ParamTypes matches.
+    // However, printf is varadic. For simplicity, we declare it with fixed args if needed.
+    return 0;
