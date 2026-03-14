@@ -35,7 +35,7 @@ cargo run -- run examples/fibonacci.pyrs --optimize --output fib
 1. **Generate LLVM IR**:
 
     ```bash
-    cargo run -- --emit-llvm your_file.pyrs > output.ll
+    cargo run -- build your_file.pyrs --emit-llvm > output.ll
     ```
 
 2. **Compile and Link**:
@@ -66,7 +66,7 @@ Full command chain:
 
 ```bash
 cargo build
-./target/debug/pyrs --emit-llvm hello.pyrs > hello.ll
+./target/debug/pyrs build hello.pyrs --emit-llvm > hello.ll
 clang-20 hello.ll -o hello
 ./hello
 ```

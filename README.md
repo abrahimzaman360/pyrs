@@ -35,10 +35,16 @@ The `examples/` directory contains sample PyRS programs:
 
 ### Running an Example
 
-To run the Fibonacci example:
+To run the Fibonacci example automatically:
 
 ```bash
-cargo run -- --emit-llvm examples/fibonacci.pyrs > fib.ll
+cargo run -- run examples/fibonacci.pyrs
+```
+
+To build and link manually:
+
+```bash
+cargo run -- build examples/fibonacci.pyrs --emit-llvm > fib.ll
 clang-20 fib.ll -o fib
 ./fib
 echo $? # Should output 55
