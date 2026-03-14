@@ -11,6 +11,7 @@ use lexer::Lexer;
 use parser::Parser;
 use semantic::Analyzer;
 use std::fs;
+use std::path::Path;
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -58,6 +59,10 @@ enum Commands {
         /// Output binary name
         #[arg(short = 'o', long)]
         output: Option<String>,
+
+        /// C compiler/linker to use
+        #[arg(long, default_value = "clang-20")]
+        cc: String,
     },
 }
 
@@ -105,6 +110,7 @@ fn main() -> anyhow::Result<()> {
             input,
             optimize,
             output,
+            cc,
         } => {
             let content = fs::read_to_string(&input)?;
             let lexer = Lexer::new(&content);
@@ -128,13 +134,13 @@ fn main() -> anyhow::Result<()> {
 
             let bin_name = output.unwrap_or_else(|| "a.out".to_string());
             let bin_path = format!("bin/{}", bin_name);
-            let ir_path = format!(".buildout/{}.ll", bin_name);
+            let obj_path = format!(".buildout/{}.o", bin_name);
 
-            fs::write(&ir_path, codegen.module.print_to_string().to_string())?;
+            codegen.write_obj(Path::new(&obj_path))?;
 
-            // Link with clang
-            let status = std::process::Command::new("clang-20")
-                .arg(&ir_path)
+            // Link with the specified compiler
+            let status = std::process::Command::new(&cc)
+                .arg(&obj_path)
                 .arg("-o")
                 .arg(&bin_path)
                 .status()?;
@@ -146,8 +152,8 @@ fn main() -> anyhow::Result<()> {
             // Run
             let run_status = std::process::Command::new(format!("./{}", bin_path)).status()?;
 
-            // Cleanup temp IR file
-            fs::remove_file(&ir_path)?;
+            // Cleanup temp object file
+            fs::remove_file(&obj_path)?;
 
             println!(
                 "Program exited with status: {}",

@@ -23,6 +23,7 @@ pyrs <COMMAND> [OPTIONS] <INPUT>
 
 - `-O, --optimize`: Run LLVM optimization passes (Aggressive/O3).
 - `-o, --output <FILE>`: Specify the output binary name (defaults to `a.out`).
+- `--cc <COMPILER>`: Specify the C compiler/linker to use (defaults to `clang-20`).
 
 ## Compilation Workflow
 

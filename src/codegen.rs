@@ -9,6 +9,7 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::InitializationConfig;
 use inkwell::targets::Target;
 use inkwell::targets::TargetMachine;
+use inkwell::targets::FileType;
 use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
@@ -77,6 +78,26 @@ impl<'ctx> Codegen<'ctx> {
             .run_passes("default<O3>", &machine, options)
             .map_err(|e| anyhow!(e.to_string()))?;
 
+        Ok(())
+    }
+
+    pub fn write_obj(&self, path: &std::path::Path) -> Result<()> {
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).map_err(|e| anyhow!(e.to_string()))?;
+        let machine = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "",
+                OptimizationLevel::Aggressive,
+                inkwell::targets::RelocMode::Default,
+                inkwell::targets::CodeModel::Default,
+            )
+            .ok_or_else(|| anyhow!("Could not create target machine"))?;
+
+        machine
+            .write_to_file(&self.module, FileType::Object, path)
+            .map_err(|e| anyhow!(e.to_string()))?;
         Ok(())
     }
 

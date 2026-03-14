@@ -41,6 +41,12 @@ To run the Fibonacci example automatically:
 cargo run -- run examples/fibonacci.pyrs
 ```
 
+To use a specific compiler (e.g., `gcc`):
+
+```bash
+cargo run -- run examples/fibonacci.pyrs --cc gcc
+```
+
 To build and link manually:
 
 ```bash
