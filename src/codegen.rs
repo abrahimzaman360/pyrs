@@ -11,7 +11,7 @@ use inkwell::targets::FileType;
 use inkwell::targets::InitializationConfig;
 use inkwell::targets::Target;
 use inkwell::targets::TargetMachine;
-use inkwell::types::{BasicType, BasicTypeEnum};
+use inkwell::types::{BasicType, BasicTypeEnum, StructType};
 use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
 
@@ -27,7 +27,13 @@ pub struct Codegen<'ctx> {
     scopes: Vec<HashMap<String, (PointerValue<'ctx>, Type)>>,
     fn_value_opt: Option<FunctionValue<'ctx>>,
     loop_stack: Vec<LoopContext<'ctx>>,
+    struct_types: HashMap<String, StructType<'ctx>>,
+    struct_metadata: HashMap<String, Struct>,
+    last_type: Type,
+    fn_name_map: HashMap<String, String>, // internal_name -> external_name
 }
+
+use crate::semantic::ModuleSymbols;
 
 impl<'ctx> Codegen<'ctx> {
     pub fn new(context: &'ctx Context, module_name: &str) -> Self {
@@ -43,7 +49,7 @@ impl<'ctx> Codegen<'ctx> {
                 "generic",
                 "",
                 OptimizationLevel::Aggressive,
-                inkwell::targets::RelocMode::Default,
+                inkwell::targets::RelocMode::PIC,
                 inkwell::targets::CodeModel::Default,
             ) {
                 module.set_data_layout(&machine.get_target_data().get_data_layout());
@@ -58,6 +64,10 @@ impl<'ctx> Codegen<'ctx> {
             scopes: vec![HashMap::new()],
             fn_value_opt: None,
             loop_stack: Vec::new(),
+            struct_types: HashMap::new(),
+            struct_metadata: HashMap::new(),
+            last_type: Type::Void,
+            fn_name_map: HashMap::new(),
         }
     }
 
@@ -103,7 +113,7 @@ impl<'ctx> Codegen<'ctx> {
                 "generic",
                 "",
                 OptimizationLevel::Aggressive,
-                inkwell::targets::RelocMode::Default,
+                inkwell::targets::RelocMode::PIC,
                 inkwell::targets::CodeModel::Default,
             )
             .ok_or_else(|| anyhow!("Could not create target machine"))?;
@@ -127,7 +137,7 @@ impl<'ctx> Codegen<'ctx> {
                 "generic",
                 "",
                 OptimizationLevel::Aggressive,
-                inkwell::targets::RelocMode::Default,
+                inkwell::targets::RelocMode::PIC,
                 inkwell::targets::CodeModel::Default,
             )
             .ok_or_else(|| anyhow!("Could not create target machine"))?;
@@ -138,7 +148,26 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
-    pub fn gen_program(&mut self, program: Program) -> Result<()> {
+    pub fn gen_program(
+        &mut self,
+        program: Program,
+        module_symbols: &HashMap<String, ModuleSymbols>,
+    ) -> Result<()> {
+        for item in &program.items {
+            match item {
+                TopLevel::Import(_) => {
+                    // TODO: Support module objects
+                }
+                TopLevel::FromImport(from) => {
+                    self.gen_from_import(from, module_symbols)?;
+                }
+                TopLevel::Struct(s) => {
+                    self.gen_struct_type(s)?;
+                }
+                _ => {}
+            }
+        }
+
         for item in program.items {
             match item {
                 TopLevel::Function(f) => {
@@ -147,10 +176,82 @@ impl<'ctx> Codegen<'ctx> {
                 TopLevel::Extern(e) => {
                     self.gen_extern(e)?;
                 }
-                TopLevel::Import(_) | TopLevel::FromImport(_) => {
-                    // Imports not yet implemented; skip silently
+                TopLevel::Impl(im) => {
+                    self.gen_impl(&im)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn gen_from_import(
+        &mut self,
+        from: &FromImport,
+        module_symbols: &HashMap<String, ModuleSymbols>,
+    ) -> Result<()> {
+        let mod_name = from.module_path.join(".");
+        let other_mod = module_symbols
+            .get(&mod_name)
+            .ok_or_else(|| anyhow!("Module '{}' not found", mod_name))?;
+
+        for (name, alias) in &from.names {
+            let external_name = name;
+            let internal_name = alias.as_ref().unwrap_or(name);
+
+            if let Some((params, ret, variadic)) = other_mod.functions.get(external_name) {
+                let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = params
+                    .iter()
+                    .map(|ty| self.get_llvm_type(ty).into())
+                    .collect();
+
+                let fn_type = if *ret == Type::Void {
+                    self.context.void_type().fn_type(&param_types, *variadic)
+                } else {
+                    self.get_llvm_type(ret).fn_type(&param_types, *variadic)
+                };
+
+                // We add the function with its TRUE external name for linking
+                self.module.add_function(external_name, fn_type, None);
+                // And map the internal name to it
+                self.fn_name_map
+                    .insert(internal_name.clone(), external_name.clone());
+            }
+
+            if let Some(s) = other_mod.structs.get(external_name) {
+                // For structs, we just need to know their layout if we use them
+                self.gen_struct_type(s)?;
+                // If there's an alias, we should probably map it too
+                if let Some(a) = alias {
+                    self.struct_types
+                        .insert(a.clone(), *self.struct_types.get(external_name).unwrap());
+                    self.struct_metadata.insert(a.clone(), s.clone());
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn gen_struct_type(&mut self, s: &Struct) -> Result<()> {
+        let field_types: Vec<BasicTypeEnum> = s
+            .fields
+            .iter()
+            .map(|(_, ty)| self.get_llvm_type(ty))
+            .collect();
+        let struct_type = self.context.opaque_struct_type(&s.name);
+        struct_type.set_body(&field_types, false);
+        self.struct_types.insert(s.name.clone(), struct_type);
+        self.struct_metadata.insert(s.name.clone(), s.clone());
+        Ok(())
+    }
+
+    fn gen_impl(&mut self, im: &Impl) -> Result<()> {
+        for method in &im.methods {
+            // Mangle name: StructName::MethodName
+            let mangled_name = format!("{}::{}", im.target, method.name);
+            let mut methods_item = method.clone();
+            methods_item.name = mangled_name;
+            self.gen_function(methods_item)?;
         }
         Ok(())
     }
@@ -163,10 +264,12 @@ impl<'ctx> Codegen<'ctx> {
             .collect();
 
         let fn_type = if e.return_type == Type::Void {
-            self.context.void_type().fn_type(&param_types, false)
+            self.context
+                .void_type()
+                .fn_type(&param_types, e.is_variadic)
         } else {
             self.get_llvm_type(&e.return_type)
-                .fn_type(&param_types, false)
+                .fn_type(&param_types, e.is_variadic)
         };
 
         Ok(self.module.add_function(&e.name, fn_type, None))
@@ -310,10 +413,11 @@ impl<'ctx> Codegen<'ctx> {
     fn gen_expr_stmt(&mut self, expr: &Expr) -> Result<()> {
         match expr {
             Expr::Call(name, args) => {
+                let actual_name = self.fn_name_map.get(name).unwrap_or(name);
                 let fn_val = self
                     .module
-                    .get_function(name)
-                    .ok_or_else(|| anyhow!("Undefined function: {}", name))?;
+                    .get_function(actual_name)
+                    .ok_or_else(|| anyhow!("Undefined function: {}", actual_name))?;
                 let mut llvm_args = Vec::new();
                 for arg in args {
                     llvm_args.push(self.gen_expr(arg)?.into());
@@ -553,23 +657,33 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn gen_expr(&mut self, expr: &Expr) -> Result<BasicValueEnum<'ctx>> {
-        match expr {
-            Expr::Int(i) => Ok(self
-                .context
-                .i64_type()
-                .const_int(*i as u64, true)
-                .as_basic_value_enum()),
-            Expr::Float(f) => Ok(self
-                .context
-                .f64_type()
-                .const_float(*f)
-                .as_basic_value_enum()),
-            Expr::Bool(b) => Ok(self
-                .context
-                .bool_type()
-                .const_int(if *b { 1 } else { 0 }, false)
-                .as_basic_value_enum()),
+        let val = match expr {
+            Expr::Int(i) => {
+                self.last_type = Type::Int;
+                Ok(self
+                    .context
+                    .i64_type()
+                    .const_int(*i as u64, true)
+                    .as_basic_value_enum())
+            }
+            Expr::Float(f) => {
+                self.last_type = Type::Float;
+                Ok(self
+                    .context
+                    .f64_type()
+                    .const_float(*f)
+                    .as_basic_value_enum())
+            }
+            Expr::Bool(b) => {
+                self.last_type = Type::Bool;
+                Ok(self
+                    .context
+                    .bool_type()
+                    .const_int(if *b { 1 } else { 0 }, false)
+                    .as_basic_value_enum())
+            }
             Expr::String(s) => {
+                self.last_type = Type::String;
                 // Remove quotes
                 let s = &s[1..s.len() - 1];
                 let s = s
@@ -581,12 +695,99 @@ impl<'ctx> Codegen<'ctx> {
                 let global_str = self.builder.build_global_string_ptr(&s, "str")?;
                 Ok(global_str.as_basic_value_enum())
             }
+            Expr::MemberAccess(expr, field_name) => {
+                let val = self.gen_expr(expr)?;
+                let ptr = val.into_pointer_value();
+                let struct_name = match &self.last_type {
+                    Type::Custom(name) => name.clone(),
+                    _ => {
+                        return Err(anyhow!(
+                            "Cannot access member of non-struct type {:?}",
+                            self.last_type
+                        ));
+                    }
+                };
+
+                let struct_type = self
+                    .struct_types
+                    .get(&struct_name)
+                    .ok_or_else(|| anyhow!("Struct type not found for {}", struct_name))?;
+                let metadata = self
+                    .struct_metadata
+                    .get(&struct_name)
+                    .ok_or_else(|| anyhow!("Metadata not found for struct {}", struct_name))?;
+
+                let field_idx = metadata
+                    .fields
+                    .iter()
+                    .position(|f| &f.0 == field_name)
+                    .ok_or_else(|| {
+                        anyhow!("Field {} not found in struct {}", field_name, struct_name)
+                    })?;
+
+                let field_ptr = self.builder.build_struct_gep(
+                    *struct_type,
+                    ptr,
+                    field_idx as u32,
+                    field_name,
+                )?;
+                let pyrs_field_ty = metadata.fields[field_idx].1.clone();
+                let llvm_field_ty = self.get_llvm_type(&pyrs_field_ty);
+
+                self.last_type = pyrs_field_ty;
+                Ok(self
+                    .builder
+                    .build_load(llvm_field_ty, field_ptr, field_name)?)
+            }
+            Expr::MethodCall(expr, method_name, args) => {
+                let val = self.gen_expr(expr)?;
+                let ptr = val.into_pointer_value();
+                let struct_name = match &self.last_type {
+                    Type::Custom(name) => name.clone(),
+                    _ => {
+                        return Err(anyhow!(
+                            "Cannot call method on non-struct type {:?}",
+                            self.last_type
+                        ));
+                    }
+                };
+
+                let mangled_name = format!("{}::{}", struct_name, method_name);
+                let fn_val = self.module.get_function(&mangled_name).ok_or_else(|| {
+                    anyhow!(
+                        "Method {} not found for struct {}",
+                        method_name,
+                        struct_name
+                    )
+                })?;
+
+                let mut llvm_args = Vec::new();
+                llvm_args.push(ptr.into()); // self
+                for arg in args {
+                    llvm_args.push(self.gen_expr(arg)?.into());
+                }
+
+                let call = self.builder.build_call(fn_val, &llvm_args, "methodtmp")?;
+
+                // For now, we don't have return type info here, so we set it to Void
+                self.last_type = Type::Void;
+
+                match call.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(v) => Ok(v),
+                    _ => Ok(self
+                        .context
+                        .i64_type()
+                        .const_int(0, false)
+                        .as_basic_value_enum()), // Default for void
+                }
+            }
             Expr::Var(name) => {
                 let (ptr, ty) = self
                     .lookup_variable(name)
                     .ok_or_else(|| anyhow!("Undefined variable: {}", name))?;
                 let ptr = *ptr;
                 let ty = ty.clone();
+                self.last_type = ty.clone();
                 Ok(self
                     .builder
                     .build_load(self.get_llvm_type(&ty), ptr, name)?)
@@ -594,12 +795,25 @@ impl<'ctx> Codegen<'ctx> {
             Expr::Binary(lhs, op, rhs) => {
                 let left = self.gen_expr(lhs)?;
                 let right = self.gen_expr(rhs)?;
-                self.gen_binary_op(left, op, right)
+                let res = self.gen_binary_op(left, op, right)?;
+                if let BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::Le
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or = op
+                {
+                    self.last_type = Type::Bool;
+                }
+                Ok(res)
             }
             Expr::Unary(op, inner) => {
                 let val = self.gen_expr(inner)?;
                 match op {
                     UnaryOp::Not => {
+                        self.last_type = Type::Bool;
                         let bool_val = val.into_int_value();
                         let result = self.builder.build_xor(
                             bool_val,
@@ -609,6 +823,7 @@ impl<'ctx> Codegen<'ctx> {
                         Ok(result.as_basic_value_enum())
                     }
                     UnaryOp::Neg => {
+                        // last_type stays same
                         if val.is_int_value() {
                             Ok(self
                                 .builder
@@ -624,24 +839,43 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             Expr::Call(name, args) => {
-                let fn_val = self
-                    .module
-                    .get_function(name)
-                    .ok_or_else(|| anyhow!("Undefined function: {}", name))?;
-                let mut llvm_args = Vec::new();
-                for arg in args {
-                    llvm_args.push(self.gen_expr(arg)?.into());
-                }
-                let call = self.builder.build_call(fn_val, &llvm_args, "calltmp")?;
-                match call.try_as_basic_value() {
-                    inkwell::values::ValueKind::Basic(v) => Ok(v),
-                    _ => Err(anyhow!(
-                        "Call to '{}' returned void when value expected",
-                        name
-                    )),
+                if let Some(st) = self.struct_types.get(name).cloned() {
+                    // Constructor
+                    let alloca = self.create_entry_block_alloca(
+                        self.fn_value_opt.unwrap().get_name().to_str().unwrap(),
+                        "struct_tmp",
+                        &Type::Custom(name.clone()),
+                    );
+                    for (i, arg) in args.iter().enumerate() {
+                        let val = self.gen_expr(arg)?;
+                        let field_ptr =
+                            self.builder
+                                .build_struct_gep(st, alloca, i as u32, "field_ptr")?;
+                        self.builder.build_store(field_ptr, val)?;
+                    }
+                    self.last_type = Type::Custom(name.clone());
+                    Ok(alloca.as_basic_value_enum())
+                } else {
+                    let fn_val = self
+                        .module
+                        .get_function(name)
+                        .ok_or_else(|| anyhow!("Undefined function: {}", name))?;
+                    let mut llvm_args = Vec::new();
+                    for arg in args {
+                        llvm_args.push(self.gen_expr(arg)?.into());
+                    }
+                    let call = self.builder.build_call(fn_val, &llvm_args, "calltmp")?;
+                    match call.try_as_basic_value() {
+                        inkwell::values::ValueKind::Basic(v) => Ok(v),
+                        _ => Err(anyhow!(
+                            "Call to '{}' returned void when value expected",
+                            name
+                        )),
+                    }
                 }
             }
-        }
+        };
+        val
     }
 
     fn gen_binary_op(
@@ -768,6 +1002,15 @@ impl<'ctx> Codegen<'ctx> {
                 .context
                 .ptr_type(inkwell::AddressSpace::from(0))
                 .as_basic_type_enum(),
+            Type::Custom(name) => {
+                if let Some(_st) = self.struct_types.get(name) {
+                    self.context
+                        .ptr_type(inkwell::AddressSpace::from(0))
+                        .as_basic_type_enum()
+                } else {
+                    panic!("Unknown custom type: {}", name);
+                }
+            }
             Type::Void => panic!("Void has no basic type"),
         }
     }

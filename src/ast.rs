@@ -5,6 +5,7 @@ pub enum Type {
     Bool,
     String,
     Void,
+    Custom(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +41,8 @@ pub enum Expr {
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     Unary(UnaryOp, Box<Expr>),
     Call(String, Vec<Expr>),
+    MemberAccess(Box<Expr>, String),
+    MethodCall(Box<Expr>, String, Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,10 +50,8 @@ pub enum Stmt {
     Let(String, Type, Option<Expr>),
     Assign(String, Expr),
     If(Expr, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
-    // If(condition, then_body, elif_branches: Vec<(condition, body)>, else_body)
     While(Expr, Vec<Stmt>),
     For(String, Expr, Expr, Option<Expr>, Vec<Stmt>),
-    // For(var_name, start, end, step, body) - for i in range(start, end[, step])
     Break,
     Continue,
     Return(Option<Expr>),
@@ -71,6 +72,28 @@ pub enum TopLevel {
     Extern(ExternDecl),
     Import(Import),
     FromImport(FromImport),
+    Struct(Struct),
+    Impl(Impl),
+    Trait(Trait),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Struct {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Impl {
+    pub target: String,
+    pub trait_name: Option<String>,
+    pub methods: Vec<Function>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trait {
+    pub name: String,
+    pub methods: Vec<Function>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,10 +113,10 @@ pub struct ExternDecl {
     pub name: String,
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
+    pub is_variadic: bool,
 }
 
-#[allow(unused)]
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<TopLevel>,
 }

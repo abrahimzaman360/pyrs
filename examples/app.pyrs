@@ -1,0 +1,12 @@
+from lib import add, Point, create_point;
+
+extern printf(format: str, ...) -> int;
+
+def main() -> int:
+    let sum: int = add(10, 20);
+    printf("Sum: %d\n", sum);
+
+    let p: Point = create_point(1, 2);
+    printf("Point: (%d, %d)\n", p.x, p.y);
+
+    return 0;

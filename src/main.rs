@@ -10,8 +10,9 @@ use inkwell::context::Context;
 use lexer::Lexer;
 use parser::Parser;
 use semantic::Analyzer;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -66,6 +67,97 @@ enum Commands {
     },
 }
 
+#[allow(unused)]
+#[derive(Debug)]
+struct Module {
+    path: PathBuf,
+    program: ast::Program,
+}
+
+struct ModuleLoader {
+    modules: HashMap<String, Module>,
+    pending: VecDeque<(String, PathBuf)>,
+}
+
+impl ModuleLoader {
+    fn new() -> Self {
+        Self {
+            modules: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn load_all(&mut self, entry_path: &Path) -> anyhow::Result<HashMap<String, Module>> {
+        let entry_name = entry_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("main")
+            .to_string();
+
+        self.pending
+            .push_back((entry_name, entry_path.to_path_buf()));
+
+        while let Some((module_name, path)) = self.pending.pop_front() {
+            if self.modules.contains_key(&module_name) {
+                continue;
+            }
+
+            let content = fs::read_to_string(&path)?;
+            let lexer = Lexer::new(&content);
+            let mut parser = Parser::new(lexer);
+            let program = parser.parse_program()?;
+
+            // Extract dependencies
+            for item in &program.items {
+                match item {
+                    ast::TopLevel::Import(imp) => {
+                        let dep_name = imp.path.join(".");
+                        let dep_path = self.resolve_path(&path, &imp.path)?;
+                        if !self.modules.contains_key(&dep_name) {
+                            self.pending.push_back((dep_name, dep_path));
+                        }
+                    }
+                    ast::TopLevel::FromImport(from) => {
+                        let dep_name = from.module_path.join(".");
+                        let dep_path = self.resolve_path(&path, &from.module_path)?;
+                        if !self.modules.contains_key(&dep_name) {
+                            self.pending.push_back((dep_name, dep_path));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            self.modules
+                .insert(module_name.clone(), Module { path, program });
+        }
+
+        Ok(std::mem::take(&mut self.modules))
+    }
+
+    fn resolve_path(&self, current_file: &Path, module_path: &[String]) -> anyhow::Result<PathBuf> {
+        let mut path = current_file
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        for (i, part) in module_path.iter().enumerate() {
+            path.push(part);
+            if i == module_path.len() - 1 {
+                path.set_extension("pyrs");
+            }
+        }
+
+        if path.exists() {
+            Ok(path)
+        } else {
+            Err(anyhow::anyhow!(
+                "Module not found: {}",
+                module_path.join(".")
+            ))
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -76,34 +168,42 @@ fn main() -> anyhow::Result<()> {
             ast,
             emit_llvm,
         } => {
-            let content = fs::read_to_string(&input)?;
+            let entry_path = Path::new(&input);
+            let mut loader = ModuleLoader::new();
+            let modules = loader.load_all(entry_path)?;
 
             if lex {
-                let lexer = Lexer::new(&content);
-                for token in lexer {
-                    println!("{:?}", token);
+                for (name, module) in &modules {
+                    println!("--- Module: {} ---", name);
+                    let content = fs::read_to_string(&module.path)?;
+                    let lexer = Lexer::new(&content);
+                    for token in lexer {
+                        println!("{:?}", token);
+                    }
                 }
                 return Ok(());
             }
 
-            let lexer = Lexer::new(&content);
-            let mut parser = Parser::new(lexer);
-            let program = parser.parse_program()?;
-
             if ast {
-                println!("{:#?}", program);
+                for (name, module) in &modules {
+                    println!("--- Module: {} ---", name);
+                    println!("{:#?}", module.program);
+                }
                 return Ok(());
             }
 
             // Semantic analysis
             let mut analyzer = Analyzer::new();
-            analyzer.analyze_program(&program)?;
+            analyzer.analyze_multi_module(&modules)?;
 
             if emit_llvm {
                 let context = Context::create();
-                let mut codegen = Codegen::new(&context, "pyrs_module");
-                codegen.gen_program(program)?;
-                println!("{}", codegen.module.print_to_string().to_string());
+                for (name, module) in &modules {
+                    println!("--- Module: {} ---", name);
+                    let mut codegen = Codegen::new(&context, name);
+                    codegen.gen_program(module.program.clone(), &analyzer.module_symbols)?;
+                    println!("{}", codegen.module.print_to_string().to_string());
+                }
             }
         }
         Commands::Run {
@@ -112,38 +212,44 @@ fn main() -> anyhow::Result<()> {
             output,
             cc,
         } => {
-            let content = fs::read_to_string(&input)?;
-            let lexer = Lexer::new(&content);
-            let mut parser = Parser::new(lexer);
-            let program = parser.parse_program()?;
+            let entry_path = Path::new(&input);
+            let mut loader = ModuleLoader::new();
+            let modules = loader.load_all(entry_path)?;
 
             let mut analyzer = Analyzer::new();
-            analyzer.analyze_program(&program)?;
+            analyzer.analyze_multi_module(&modules)?;
 
             let context = Context::create();
-            let mut codegen = Codegen::new(&context, "pyrs_module");
-            codegen.gen_program(program)?;
-
-            if optimize {
-                codegen.optimize()?;
-            }
+            let mut obj_files = Vec::new();
 
             // Ensure build directories exist
             fs::create_dir_all(".buildout")?;
             fs::create_dir_all("bin")?;
 
+            for (name, module) in &modules {
+                let mut codegen = Codegen::new(&context, name);
+                codegen.gen_program(module.program.clone(), &analyzer.module_symbols)?;
+
+                if optimize {
+                    codegen.optimize()?;
+                }
+
+                let obj_path = format!(".buildout/{}.o", name.replace(".", "_"));
+                codegen.write_obj(Path::new(&obj_path))?;
+                obj_files.push(obj_path);
+            }
+
             let bin_name = output.unwrap_or_else(|| "a.out".to_string());
             let bin_path = format!("bin/{}", bin_name);
-            let obj_path = format!(".buildout/{}.o", bin_name);
-
-            codegen.write_obj(Path::new(&obj_path))?;
 
             // Link with the specified compiler
-            let status = std::process::Command::new(&cc)
-                .arg(&obj_path)
-                .arg("-o")
-                .arg(&bin_path)
-                .status()?;
+            let mut cmd = std::process::Command::new(&cc);
+            for obj in &obj_files {
+                cmd.arg(obj);
+            }
+            cmd.arg("-o").arg(&bin_path);
+
+            let status = cmd.status()?;
 
             if !status.success() {
                 return Err(anyhow::anyhow!("Linking failed"));
@@ -152,8 +258,10 @@ fn main() -> anyhow::Result<()> {
             // Run
             let run_status = std::process::Command::new(format!("./{}", bin_path)).status()?;
 
-            // Cleanup temp object file
-            fs::remove_file(&obj_path)?;
+            // Cleanup temp object files
+            for obj in obj_files {
+                fs::remove_file(obj)?;
+            }
 
             println!(
                 "Program exited with status: {}",

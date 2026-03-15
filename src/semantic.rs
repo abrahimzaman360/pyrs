@@ -52,48 +52,160 @@ impl SymbolTable {
     }
 }
 
+pub struct ModuleSymbols {
+    pub functions: HashMap<String, (Vec<Type>, Type, bool)>, // (params, ret, is_variadic)
+    pub structs: HashMap<String, Struct>,
+}
+
+impl ModuleSymbols {
+    pub fn new() -> Self {
+        Self {
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+        }
+    }
+}
+
+#[allow(unused)]
 pub struct Analyzer {
+    pub module_symbols: HashMap<String, ModuleSymbols>,
+    pub current_module: String,
     symbols: SymbolTable,
-    functions: HashMap<String, (Vec<Type>, Type)>,
+    functions: HashMap<String, (Vec<Type>, Type, bool)>,
+    structs: HashMap<String, Struct>,
     in_loop: bool,
+    impls: HashMap<String, Vec<Impl>>,
 }
 
 impl Analyzer {
     pub fn new() -> Self {
         Self {
+            module_symbols: HashMap::new(),
+            current_module: String::new(),
             symbols: SymbolTable::new(),
             functions: HashMap::new(),
+            structs: HashMap::new(),
             in_loop: false,
+            impls: HashMap::new(),
         }
     }
 
-    pub fn analyze_program(&mut self, program: &Program) -> Result<()> {
-        // First pass: collect function signatures
+    pub fn analyze_multi_module(&mut self, modules: &HashMap<String, crate::Module>) -> Result<()> {
+        // Pass 1: Collect signatures from all modules
+        for (name, module) in modules {
+            self.current_module = name.clone();
+            let mut symbols = ModuleSymbols::new();
+            self.collect_signatures(&module.program, &mut symbols)?;
+            self.module_symbols.insert(name.clone(), symbols);
+        }
+
+        // Pass 2: Analyze all module bodies
+        for (name, module) in modules {
+            self.current_module = name.clone();
+            self.analyze_program(&module.program)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_signatures(&mut self, program: &Program, symbols: &mut ModuleSymbols) -> Result<()> {
         for item in &program.items {
             match item {
                 TopLevel::Function(f) => {
                     let param_types = f.params.iter().map(|(_, t)| t.clone()).collect();
-                    if self.functions.contains_key(&f.name) {
-                        return Err(anyhow!("Function '{}' already defined", f.name));
+                    if symbols.functions.contains_key(&f.name) {
+                        return Err(anyhow!(
+                            "Function '{}' already defined in module '{}'",
+                            f.name,
+                            self.current_module
+                        ));
                     }
-                    self.functions
-                        .insert(f.name.clone(), (param_types, f.return_type.clone()));
+                    symbols
+                        .functions
+                        .insert(f.name.clone(), (param_types, f.return_type.clone(), false));
                 }
                 TopLevel::Extern(e) => {
-                    let param_types = e.params.iter().map(|(_, t)| t.clone()).collect();
-                    if self.functions.contains_key(&e.name) {
-                        return Err(anyhow!("Function '{}' already defined", e.name));
+                    let params = e.params.iter().map(|p| p.1.clone()).collect();
+                    if symbols.functions.contains_key(&e.name) {
+                        return Err(anyhow!(
+                            "Function '{}' already defined in module '{}'",
+                            e.name,
+                            self.current_module
+                        ));
                     }
-                    self.functions
-                        .insert(e.name.clone(), (param_types, e.return_type.clone()));
+                    symbols.functions.insert(
+                        e.name.clone(),
+                        (params, e.return_type.clone(), e.is_variadic),
+                    );
                 }
-                TopLevel::Import(_) | TopLevel::FromImport(_) => {
-                    // Imports are not yet implemented; silently ignore for now
+                TopLevel::Struct(s) => {
+                    if symbols.structs.contains_key(&s.name) {
+                        return Err(anyhow!(
+                            "Struct '{}' already defined in module '{}'",
+                            s.name,
+                            self.current_module
+                        ));
+                    }
+                    symbols.structs.insert(s.name.clone(), s.clone());
                 }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn analyze_program(&mut self, program: &Program) -> Result<()> {
+        self.symbols = SymbolTable::new();
+        self.functions.clear();
+        self.structs.clear();
+
+        // 1. Add local symbols
+        if let Some(local_mod) = self.module_symbols.get(&self.current_module) {
+            self.functions.extend(local_mod.functions.clone());
+            self.structs.extend(local_mod.structs.clone());
+        }
+
+        // 2. Handle imports
+        for item in &program.items {
+            match item {
+                TopLevel::Import(_imp) => {
+                    // TODO: Support module-level access (e.g., math.sqrt)
+                }
+                TopLevel::FromImport(from) => {
+                    let mod_name = from.module_path.join(".");
+                    let other_mod = self
+                        .module_symbols
+                        .get(&mod_name)
+                        .ok_or_else(|| anyhow!("Module '{}' not found", mod_name))?;
+
+                    for (name, alias) in &from.names {
+                        let local_name = alias.as_ref().unwrap_or(name);
+                        let mut found = false;
+                        if let Some((params, ret, variadic)) = other_mod.functions.get(name) {
+                            self.functions.insert(
+                                alias.clone().unwrap_or(name.clone()),
+                                (params.clone(), ret.clone(), *variadic),
+                            );
+                            found = true;
+                        }
+                        if let Some(s) = other_mod.structs.get(name) {
+                            self.structs.insert(local_name.clone(), s.clone());
+                            found = true;
+                        }
+                        if !found {
+                            return Err(anyhow!(
+                                "Name '{}' not found in module '{}'",
+                                name,
+                                mod_name
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        // Second pass: analyze function bodies
+        // 3. Analyze function bodies
         for item in &program.items {
             if let TopLevel::Function(f) = item {
                 self.analyze_function(f)?;
@@ -221,10 +333,7 @@ impl Analyzer {
                 let start_ty = self.analyze_expr(start)?;
                 let end_ty = self.analyze_expr(end)?;
                 if start_ty != Type::Int {
-                    return Err(anyhow!(
-                        "For loop start must be int, found {:?}",
-                        start_ty
-                    ));
+                    return Err(anyhow!("For loop start must be int, found {:?}", start_ty));
                 }
                 if end_ty != Type::Int {
                     return Err(anyhow!("For loop end must be int, found {:?}", end_ty));
@@ -232,10 +341,7 @@ impl Analyzer {
                 if let Some(s) = step {
                     let step_ty = self.analyze_expr(s)?;
                     if step_ty != Type::Int {
-                        return Err(anyhow!(
-                            "For loop step must be int, found {:?}",
-                            step_ty
-                        ));
+                        return Err(anyhow!("For loop step must be int, found {:?}", step_ty));
                     }
                 }
                 self.symbols.push_scope();
@@ -300,10 +406,7 @@ impl Analyzer {
                     .lookup(name)
                     .ok_or_else(|| anyhow!("Undefined variable: '{}'", name))?;
                 if !entry.1 {
-                    return Err(anyhow!(
-                        "Variable '{}' used before initialization",
-                        name
-                    ));
+                    return Err(anyhow!("Variable '{}' used before initialization", name));
                 }
                 Ok(entry.0.clone())
             }
@@ -385,34 +488,142 @@ impl Analyzer {
                 }
             }
             Expr::Call(name, args) => {
-                let (param_types, return_type) = self
-                    .functions
-                    .get(name)
-                    .ok_or_else(|| anyhow!("Undefined function: '{}'", name))?;
-
-                if args.len() != param_types.len() {
-                    return Err(anyhow!(
-                        "Function '{}' expected {} arguments, found {}",
-                        name,
-                        param_types.len(),
-                        args.len()
-                    ));
-                }
-
-                for (idx, arg) in args.iter().enumerate() {
-                    let arg_ty = self.analyze_expr(arg)?;
-                    if arg_ty != param_types[idx] {
+                if let Some((param_types, return_type, variadic)) =
+                    self.functions.get(name).cloned()
+                {
+                    if args.len() < param_types.len()
+                        || (!variadic && args.len() > param_types.len())
+                    {
                         return Err(anyhow!(
-                            "Type mismatch in argument {} for call to '{}': expected {:?}, found {:?}",
-                            idx + 1,
+                            "Function '{}' expected {} arguments, found {}",
                             name,
-                            param_types[idx],
-                            arg_ty
+                            param_types.len(),
+                            args.len()
                         ));
                     }
-                }
+                    for (i, arg) in args.iter().enumerate() {
+                        let arg_type = self.analyze_expr(arg)?;
+                        if i < param_types.len() && arg_type != param_types[i] {
+                            return Err(anyhow!(
+                                "Function '{}' argument {} type mismatch: expected {:?}, found {:?}",
+                                name,
+                                i,
+                                param_types[i],
+                                arg_type
+                            ));
+                        }
+                        // For variadic arguments, we don't have a specific type to check against
+                        // They are typically handled at a lower level (e.g., C FFI)
+                    }
+                    return Ok(return_type);
+                } else if let Some(s) = self.structs.get(name) {
+                    // Constructor: params are field types, returns struct type
+                    let param_types: Vec<Type> = s.fields.iter().map(|(_, t)| t.clone()).collect();
+                    let return_type = Type::Custom(name.clone());
 
-                Ok(return_type.clone())
+                    if args.len() != param_types.len() {
+                        return Err(anyhow!(
+                            "Constructor for '{}' expected {} arguments, found {}",
+                            name,
+                            param_types.len(),
+                            args.len()
+                        ));
+                    }
+
+                    for (idx, arg) in args.iter().enumerate() {
+                        let arg_ty = self.analyze_expr(arg)?;
+                        if arg_ty != param_types[idx] {
+                            return Err(anyhow!(
+                                "Type mismatch in argument {} for constructor '{}': expected {:?}, found {:?}",
+                                idx + 1,
+                                name,
+                                param_types[idx],
+                                arg_ty
+                            ));
+                        }
+                    }
+                    return Ok(return_type);
+                } else {
+                    Err(anyhow!("Undefined function or struct: '{}'", name))
+                }
+            }
+            Expr::MemberAccess(expr, member) => {
+                let ty = self.analyze_expr(expr)?;
+                match ty {
+                    Type::Custom(struct_name) => {
+                        let s = self
+                            .structs
+                            .get(&struct_name)
+                            .ok_or_else(|| anyhow!("Unknown struct '{}'", struct_name))?;
+                        for (f_name, f_ty) in &s.fields {
+                            if f_name == member {
+                                return Ok(f_ty.clone());
+                            }
+                        }
+                        Err(anyhow!(
+                            "Struct '{}' has no field '{}'",
+                            struct_name,
+                            member
+                        ))
+                    }
+                    _ => Err(anyhow!("Cannot access member of non-struct type {:?}", ty)),
+                }
+            }
+            Expr::MethodCall(expr, method_name, args) => {
+                let ty = self.analyze_expr(expr)?;
+                match ty {
+                    Type::Custom(struct_name) => {
+                        // Look for methods in impls for this struct
+                        if let Some(impls) = self.impls.get(&struct_name) {
+                            for im in impls {
+                                for method in &im.methods {
+                                    if &method.name == method_name {
+                                        // Found the method. Verify arguments.
+                                        // Note: we skip 'self' which should be the first param.
+                                        let mut expected_params = Vec::new();
+                                        for (p_name, p_ty) in &method.params {
+                                            if p_name != "self" {
+                                                expected_params.push(p_ty.clone());
+                                            }
+                                        }
+
+                                        if args.len() != expected_params.len() {
+                                            return Err(anyhow!(
+                                                "Method '{}' on struct '{}' expected {} arguments, found {}",
+                                                method_name,
+                                                struct_name,
+                                                expected_params.len(),
+                                                args.len()
+                                            ));
+                                        }
+
+                                        for (idx, arg) in args.iter().enumerate() {
+                                            let arg_ty = self.analyze_expr(arg)?;
+                                            if arg_ty != expected_params[idx] {
+                                                return Err(anyhow!(
+                                                    "Type mismatch in argument {} for call to '{}' on struct '{}': expected {:?}, found {:?}",
+                                                    idx + 1,
+                                                    method_name,
+                                                    struct_name,
+                                                    expected_params[idx],
+                                                    arg_ty
+                                                ));
+                                            }
+                                        }
+
+                                        return Ok(method.return_type.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(anyhow!(
+                            "No method '{}' found for struct '{}'",
+                            method_name,
+                            struct_name
+                        ))
+                    }
+                    _ => Err(anyhow!("Cannot call method on non-struct type {:?}", ty)),
+                }
             }
         }
     }

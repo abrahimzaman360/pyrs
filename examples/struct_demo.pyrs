@@ -1,0 +1,15 @@
+struct Point:
+    x: int,
+    y: int,
+
+impl Point:
+    def get_x(self) -> int:
+        return self.x;
+    
+    def set_x(self, val: int):
+        self.x = val;
+
+def main() -> int:
+    let p: Point = Point(10, 20);
+    p.set_x(42);
+    return p.get_x(); # Should return 42

@@ -45,8 +45,20 @@ pub enum RawToken {
     From,
     #[token("as")]
     As,
+    #[token("...")]
+    Ellipsis,
     #[token(".")]
     Dot,
+    #[token("struct")]
+    Struct,
+    #[token("impl")]
+    Impl,
+    #[token("trait")]
+    Trait,
+    #[token("match")]
+    Match,
+    #[token("self")]
+    SelfLower,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -132,6 +144,12 @@ pub enum Token {
     From,
     As,
     Dot,
+    Struct,
+    Impl,
+    Trait,
+    Match,
+    SelfLower,
+    Ellipsis,
     Ident(String),
     Int(i64),
     Float(f64),
@@ -188,6 +206,12 @@ impl From<RawToken> for Token {
             RawToken::From => Token::From,
             RawToken::As => Token::As,
             RawToken::Dot => Token::Dot,
+            RawToken::Ellipsis => Token::Ellipsis,
+            RawToken::Struct => Token::Struct,
+            RawToken::Impl => Token::Impl,
+            RawToken::Trait => Token::Trait,
+            RawToken::Match => Token::Match,
+            RawToken::SelfLower => Token::SelfLower,
             RawToken::Ident(s) => Token::Ident(s),
             RawToken::Int(i) => Token::Int(i),
             RawToken::Float(f) => Token::Float(f),
@@ -266,7 +290,10 @@ impl<'a> Lexer<'a> {
         // Check for comment-only line
         let remaining = &remainder[bytes_to_skip..];
         if remaining.starts_with("//") {
-            let line_end = remaining.find('\n').map(|p| p + 1).unwrap_or(remaining.len());
+            let line_end = remaining
+                .find('\n')
+                .map(|p| p + 1)
+                .unwrap_or(remaining.len());
             self.inner.bump(bytes_to_skip + line_end);
             return true;
         }

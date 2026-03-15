@@ -75,6 +75,9 @@ impl<'a> Parser<'a> {
             Some(Token::Extern) => Ok(TopLevel::Extern(self.parse_extern()?)),
             Some(Token::Import) => Ok(TopLevel::Import(self.parse_import()?)),
             Some(Token::From) => Ok(TopLevel::FromImport(self.parse_from_import()?)),
+            Some(Token::Struct) => Ok(TopLevel::Struct(self.parse_struct()?)),
+            Some(Token::Impl) => Ok(TopLevel::Impl(self.parse_impl()?)),
+            Some(Token::Trait) => Ok(TopLevel::Trait(self.parse_trait()?)),
             Some(Token::Newline) => {
                 self.advance();
                 self.parse_top_level()
@@ -132,7 +135,9 @@ impl<'a> Parser<'a> {
 
     fn parse_extern(&mut self) -> Result<ExternDecl> {
         self.expect(Token::Extern)?;
-        self.expect(Token::Def)?;
+        if self.peek() == Some(&Token::Def) {
+            self.advance();
+        }
         let name = match self.advance_with_token() {
             Some(Token::Ident(s)) => s,
             _ => return Err(anyhow!("Expected extern function name")),
@@ -140,8 +145,17 @@ impl<'a> Parser<'a> {
 
         self.expect(Token::LParen)?;
         let mut params = Vec::new();
+        let mut is_variadic = false;
         if self.peek() != Some(&Token::RParen) {
             loop {
+                if self.peek() == Some(&Token::Ellipsis) {
+                    self.advance();
+                    is_variadic = true;
+                    if self.peek() == Some(&Token::Comma) {
+                        return Err(anyhow!("Ellipsis must be the last parameter"));
+                    }
+                    break;
+                }
                 let p_name = match self.advance_with_token() {
                     Some(Token::Ident(s)) => s,
                     _ => return Err(anyhow!("Expected parameter name")),
@@ -171,6 +185,7 @@ impl<'a> Parser<'a> {
             name,
             params,
             return_type,
+            is_variadic,
         })
     }
 
@@ -216,6 +231,156 @@ impl<'a> Parser<'a> {
         }
         self.expect_semicolon()?;
         Ok(FromImport { module_path, names })
+    }
+
+    fn parse_struct(&mut self) -> Result<Struct> {
+        self.expect(Token::Struct)?;
+        let name = match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected struct name")),
+        };
+        self.expect(Token::Colon)?;
+        self.expect(Token::Newline)?;
+        self.expect(Token::Indent)?;
+        let mut fields = Vec::new();
+        while self.peek() != Some(&Token::Dedent) && self.peek().is_some() {
+            if self.peek() == Some(&Token::Newline) {
+                self.advance();
+                continue;
+            }
+            let f_name = match self.advance_with_token() {
+                Some(Token::Ident(s)) => s,
+                _ => return Err(anyhow!("Expected field name")),
+            };
+            self.expect(Token::Colon)?;
+            let f_type = self.parse_type()?;
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            }
+            if self.peek() == Some(&Token::Newline) {
+                self.advance();
+            }
+            fields.push((f_name, f_type));
+        }
+        self.expect(Token::Dedent)?;
+        Ok(Struct { name, fields })
+    }
+
+    fn parse_impl(&mut self) -> Result<Impl> {
+        self.expect(Token::Impl)?;
+        let name = match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected trait name or struct name in 'impl'")),
+        };
+
+        let mut trait_name = None;
+        let mut target = name.clone();
+
+        if self.peek() == Some(&Token::For) {
+            self.advance();
+            trait_name = Some(name);
+            target = match self.advance_with_token() {
+                Some(Token::Ident(s)) => s,
+                _ => return Err(anyhow!("Expected target struct name after 'for'")),
+            };
+        }
+
+        self.expect(Token::Colon)?;
+        self.expect(Token::Newline)?;
+        self.expect(Token::Indent)?;
+        let mut methods = Vec::new();
+        while self.peek() != Some(&Token::Dedent) && self.peek().is_some() {
+            if self.peek() == Some(&Token::Newline) {
+                self.advance();
+                continue;
+            }
+            methods.push(self.parse_function()?);
+            self.skip_newlines();
+        }
+        self.expect(Token::Dedent)?;
+        Ok(Impl {
+            target,
+            trait_name,
+            methods,
+        })
+    }
+
+    fn parse_trait(&mut self) -> Result<Trait> {
+        self.expect(Token::Trait)?;
+        let name = match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected trait name")),
+        };
+        self.expect(Token::Colon)?;
+        self.expect(Token::Newline)?;
+        self.expect(Token::Indent)?;
+        let mut methods = Vec::new();
+        while self.peek() != Some(&Token::Dedent) && self.peek().is_some() {
+            if self.peek() == Some(&Token::Newline) {
+                self.advance();
+                continue;
+            }
+            methods.push(self.parse_trait_method()?);
+            self.skip_newlines();
+        }
+        self.expect(Token::Dedent)?;
+        Ok(Trait { name, methods })
+    }
+
+    fn parse_trait_method(&mut self) -> Result<Function> {
+        self.expect(Token::Def)?;
+        let name = match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected method name")),
+        };
+
+        self.expect(Token::LParen)?;
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                let p_name = match self.advance_with_token() {
+                    Some(Token::Ident(s)) => s,
+                    Some(Token::SelfLower) => "self".to_string(),
+                    _ => return Err(anyhow!("Expected parameter name")),
+                };
+                if p_name != "self" {
+                    self.expect(Token::Colon)?;
+                    let p_type = self.parse_type()?;
+                    params.push((p_name, p_type));
+                } else {
+                    params.push(("self".to_string(), Type::Void));
+                }
+
+                if self.peek() == Some(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RParen)?;
+
+        let mut return_type = Type::Void;
+        if self.peek() == Some(&Token::Arrow) {
+            self.advance();
+            return_type = self.parse_type()?;
+        }
+
+        let body = if self.peek() == Some(&Token::Semicolon) {
+            self.advance();
+            Vec::new()
+        } else {
+            self.expect(Token::Colon)?;
+            self.expect(Token::Newline)?;
+            self.parse_block()?
+        };
+
+        Ok(Function {
+            name,
+            params,
+            return_type,
+            body,
+        })
     }
 
     fn parse_module_path(&mut self) -> Result<Vec<String>> {
@@ -506,18 +671,23 @@ impl<'a> Parser<'a> {
                 let right = self.parse_unary()?;
                 Ok(Expr::Unary(UnaryOp::Neg, Box::new(right)))
             }
-            _ => self.parse_primary(),
+            _ => self.parse_postfix(),
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr> {
-        match self.advance_with_token() {
-            Some(Token::Int(i)) => Ok(Expr::Int(i)),
-            Some(Token::Float(f)) => Ok(Expr::Float(f)),
-            Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
-            Some(Token::StringLit(s)) => Ok(Expr::String(s)),
-            Some(Token::Ident(s)) => {
-                if self.peek() == Some(&Token::LParen) {
+    fn parse_postfix(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_primary()?;
+        loop {
+            match self.peek() {
+                Some(Token::Dot) => {
+                    self.advance();
+                    let member = match self.advance_with_token() {
+                        Some(Token::Ident(s)) => s,
+                        _ => return Err(anyhow!("Expected member name after '.'")),
+                    };
+                    expr = Expr::MemberAccess(Box::new(expr), member);
+                }
+                Some(Token::LParen) => {
                     self.advance();
                     let mut args = Vec::new();
                     if self.peek() != Some(&Token::RParen) {
@@ -531,11 +701,33 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(Token::RParen)?;
-                    Ok(Expr::Call(s, args))
-                } else {
-                    Ok(Expr::Var(s))
+                    match expr {
+                        Expr::Var(name) => {
+                            expr = Expr::Call(name, args);
+                        }
+                        Expr::MemberAccess(obj, method) => {
+                            expr = Expr::MethodCall(obj, method, args);
+                        }
+                        _ => {
+                            return Err(anyhow!(
+                                "Calling non-identifier expressions is not yet supported"
+                            ));
+                        }
+                    }
                 }
+                _ => break,
             }
+        }
+        Ok(expr)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr> {
+        match self.advance_with_token() {
+            Some(Token::Int(i)) => Ok(Expr::Int(i)),
+            Some(Token::Float(f)) => Ok(Expr::Float(f)),
+            Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
+            Some(Token::StringLit(s)) => Ok(Expr::String(s)),
+            Some(Token::Ident(s)) => Ok(Expr::Var(s)),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
@@ -554,11 +746,9 @@ impl<'a> Parser<'a> {
                 "bool" => Ok(Type::Bool),
                 "str" | "string" => Ok(Type::String),
                 "void" => Ok(Type::Void),
-                other => Err(anyhow!(
-                    "Unknown type '{}'. Supported types: int, float, bool, str, void",
-                    other
-                )),
+                other => Ok(Type::Custom(other.to_string())),
             },
+            Some(Token::SelfLower) => Ok(Type::Custom("self".to_string())),
             _ => Err(anyhow!("Expected type name")),
         }
     }
