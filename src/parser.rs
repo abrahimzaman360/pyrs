@@ -100,11 +100,16 @@ impl<'a> Parser<'a> {
             loop {
                 let p_name = match self.advance_with_token() {
                     Some(Token::Ident(s)) => s,
+                    Some(Token::SelfLower) => "self".to_string(),
                     _ => return Err(anyhow!("Expected parameter name")),
                 };
-                self.expect(Token::Colon)?;
-                let p_type = self.parse_type()?;
-                params.push((p_name, p_type));
+                if p_name != "self" {
+                    self.expect(Token::Colon)?;
+                    let p_type = self.parse_type()?;
+                    params.push((p_name, p_type));
+                } else {
+                    params.push(("self".to_string(), Type::Void));
+                }
 
                 if self.peek() == Some(&Token::Comma) {
                     self.advance();
@@ -430,51 +435,59 @@ impl<'a> Parser<'a> {
                 self.expect_semicolon()?;
                 Ok(Stmt::Continue)
             }
-            Some(Token::Ident(_)) => {
-                // Check for assignment or augmented assignment
-                match self.peek_ahead() {
-                    Some(Token::Assign) => {
-                        let name = match self.advance_with_token() {
-                            Some(Token::Ident(s)) => s,
-                            _ => unreachable!(),
-                        };
-                        self.expect(Token::Assign)?;
-                        let expr = self.parse_expr()?;
-                        self.expect_semicolon()?;
-                        Ok(Stmt::Assign(name, expr))
-                    }
-                    Some(Token::PlusAssign)
-                    | Some(Token::MinusAssign)
-                    | Some(Token::StarAssign)
-                    | Some(Token::SlashAssign) => {
-                        let name = match self.advance_with_token() {
-                            Some(Token::Ident(s)) => s,
-                            _ => unreachable!(),
-                        };
-                        let op = match self.advance_with_token() {
-                            Some(Token::PlusAssign) => BinaryOp::Add,
-                            Some(Token::MinusAssign) => BinaryOp::Sub,
-                            Some(Token::StarAssign) => BinaryOp::Mul,
-                            Some(Token::SlashAssign) => BinaryOp::Div,
-                            _ => unreachable!(),
-                        };
-                        let rhs = self.parse_expr()?;
-                        self.expect_semicolon()?;
-                        // Desugar: x += y => x = x + y
-                        Ok(Stmt::Assign(
-                            name.clone(),
-                            Expr::Binary(Box::new(Expr::Var(name)), op, Box::new(rhs)),
-                        ))
-                    }
-                    _ => {
-                        let expr = self.parse_expr()?;
-                        self.expect_semicolon()?;
-                        Ok(Stmt::Expr(expr))
+            _ => {
+                // Peek ahead for simple variable assignment: identifier followed by '=' or '+=' etc.
+                if let Some(Token::Ident(name)) = self.peek() {
+                    let name = name.clone();
+                    match self.peek_ahead() {
+                        Some(Token::Assign) => {
+                            self.advance(); // consume ident
+                            self.advance(); // consume '='
+                            let expr = self.parse_expr()?;
+                            self.expect_semicolon()?;
+                            return Ok(Stmt::Assign(name, expr));
+                        }
+                        Some(Token::PlusAssign)
+                        | Some(Token::MinusAssign)
+                        | Some(Token::StarAssign)
+                        | Some(Token::SlashAssign) => {
+                            self.advance(); // consume ident
+                            let op = match self.advance_with_token() {
+                                Some(Token::PlusAssign) => BinaryOp::Add,
+                                Some(Token::MinusAssign) => BinaryOp::Sub,
+                                Some(Token::StarAssign) => BinaryOp::Mul,
+                                Some(Token::SlashAssign) => BinaryOp::Div,
+                                _ => unreachable!(),
+                            };
+                            let rhs = self.parse_expr()?;
+                            self.expect_semicolon()?;
+                            // Desugar: x += y => x = x + y
+                            return Ok(Stmt::Assign(
+                                name.clone(),
+                                Expr::Binary(Box::new(Expr::Var(name)), op, Box::new(rhs)),
+                            ));
+                        }
+                        _ => {} // Fall through to general expression/complex assignment
                     }
                 }
-            }
-            _ => {
+
                 let expr = self.parse_expr()?;
+                if self.peek() == Some(&Token::Assign) {
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    self.expect_semicolon()?;
+                    if let Expr::Index(target, index) = expr {
+                        return Ok(Stmt::IndexAssign(target, index, Box::new(value)));
+                    } else if let Expr::MemberAccess(obj, field) = expr {
+                        return Ok(Stmt::MemberAssign(obj, field, value));
+                    } else if let Expr::Var(name) = expr {
+                        // This handles cases where Expr::Var was returned but it was actually an assignment
+                        // (though the simple case above should catch most)
+                        return Ok(Stmt::Assign(name, value));
+                    } else {
+                        return Err(anyhow!("Invalid assignment target. Expected variable, index, or member access."));
+                    }
+                }
                 self.expect_semicolon()?;
                 Ok(Stmt::Expr(expr))
             }
@@ -663,13 +676,28 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::Not) => {
                 self.advance();
-                let right = self.parse_unary()?;
-                Ok(Expr::Unary(UnaryOp::Not, Box::new(right)))
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary(UnaryOp::Not, Box::new(expr)))
             }
             Some(Token::Minus) => {
                 self.advance();
-                let right = self.parse_unary()?;
-                Ok(Expr::Unary(UnaryOp::Neg, Box::new(right)))
+                let expr = self.parse_unary()?;
+                Ok(Expr::Unary(UnaryOp::Neg, Box::new(expr)))
+            }
+            Some(Token::Ampersand) => {
+                self.advance();
+                let mut is_mut = false;
+                if self.peek() == Some(&Token::Mut) {
+                    self.advance();
+                    is_mut = true;
+                }
+                let expr = self.parse_unary()?;
+                Ok(Expr::Borrow(Box::new(expr), is_mut))
+            }
+            Some(Token::Star) => {
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr::Deref(Box::new(expr)))
             }
             _ => self.parse_postfix(),
         }
@@ -715,6 +743,12 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                Some(Token::LBracket) => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(Token::RBracket)?;
+                    expr = Expr::Index(Box::new(expr), Box::new(index));
+                }
                 _ => break,
             }
         }
@@ -728,10 +762,36 @@ impl<'a> Parser<'a> {
             Some(Token::Bool(b)) => Ok(Expr::Bool(b)),
             Some(Token::StringLit(s)) => Ok(Expr::String(s)),
             Some(Token::Ident(s)) => Ok(Expr::Var(s)),
+            Some(Token::SelfLower) => Ok(Expr::Var("self".to_string())),
             Some(Token::LParen) => {
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
                 Ok(expr)
+            }
+            Some(Token::LBracket) => {
+                let mut items = Vec::new();
+                if self.peek() != Some(&Token::RBracket) {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if self.peek() == Some(&Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RBracket)?;
+                Ok(Expr::List(items))
+            }
+            Some(Token::Ampersand) => {
+                // For now handle &var as Index or just a placeholder?
+                // Actually, & is usually a unary operator. Let's redirect to parse_expr?
+                // No, & is handled in unary. But parse_primary should handle it if it starts there.
+                // Wait, &var is not primary. Primary is literals, vars, groups.
+                // & is a prefix operator.
+                Err(anyhow!(
+                    "References (&) should be handled in unary/prefix parsing"
+                ))
             }
             Some(t) => Err(anyhow!("Unexpected token in expression: {:?}", t)),
             None => Err(anyhow!("Unexpected EOF in expression")),
@@ -746,8 +806,27 @@ impl<'a> Parser<'a> {
                 "bool" => Ok(Type::Bool),
                 "str" | "string" => Ok(Type::String),
                 "void" => Ok(Type::Void),
+                "list" => {
+                    self.expect(Token::LBracket)?;
+                    let inner = self.parse_type()?;
+                    self.expect(Token::RBracket)?;
+                    Ok(Type::List(Box::new(inner)))
+                }
                 other => Ok(Type::Custom(other.to_string())),
             },
+            Some(Token::Ampersand) => {
+                let mut is_mut = false;
+                if self.peek() == Some(&Token::Mut) {
+                    self.advance();
+                    is_mut = true;
+                }
+                let inner = self.parse_type()?;
+                if is_mut {
+                    Ok(Type::MutRef(Box::new(inner)))
+                } else {
+                    Ok(Type::Ref(Box::new(inner)))
+                }
+            }
             Some(Token::SelfLower) => Ok(Type::Custom("self".to_string())),
             _ => Err(anyhow!("Expected type name")),
         }

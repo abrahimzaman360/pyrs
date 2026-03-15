@@ -1,0 +1,7 @@
+extern printf(format: str, ...) -> int;
+
+def main() -> int:
+    let x: list[int] = [1, 2, 3];
+    let y: list[int] = x;
+    printf("x[0]: %ld\n", x[0]); # Error: Use of moved value
+    return 0;

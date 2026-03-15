@@ -6,6 +6,9 @@ pub enum Type {
     String,
     Void,
     Custom(String),
+    List(Box<Type>),
+    Ref(Box<Type>),
+    MutRef(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,12 +46,18 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     MemberAccess(Box<Expr>, String),
     MethodCall(Box<Expr>, String, Vec<Expr>),
+    List(Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
+    Borrow(Box<Expr>, bool), // (expr, is_mut)
+    Deref(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Let(String, Type, Option<Expr>),
     Assign(String, Expr),
+    IndexAssign(Box<Expr>, Box<Expr>, Box<Expr>), // target, index, value
+    MemberAssign(Box<Expr>, String, Expr), // (object_expr, field_name, value)
     If(Expr, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
     While(Expr, Vec<Stmt>),
     For(String, Expr, Expr, Option<Expr>, Vec<Stmt>),

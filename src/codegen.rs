@@ -20,6 +20,9 @@ struct LoopContext<'ctx> {
     end_bb: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
+use crate::GcMode;
+
+#[allow(unused)]
 pub struct Codegen<'ctx> {
     pub context: &'ctx Context,
     pub module: Module<'ctx>,
@@ -31,12 +34,13 @@ pub struct Codegen<'ctx> {
     struct_metadata: HashMap<String, Struct>,
     last_type: Type,
     fn_name_map: HashMap<String, String>, // internal_name -> external_name
+    pub gc_mode: GcMode,
 }
 
 use crate::semantic::ModuleSymbols;
 
 impl<'ctx> Codegen<'ctx> {
-    pub fn new(context: &'ctx Context, module_name: &str) -> Self {
+    pub fn new(context: &'ctx Context, module_name: &str, gc_mode: GcMode) -> Self {
         let module = context.create_module(module_name);
 
         let _ = Target::initialize_native(&InitializationConfig::default());
@@ -68,6 +72,7 @@ impl<'ctx> Codegen<'ctx> {
             struct_metadata: HashMap::new(),
             last_type: Type::Void,
             fn_name_map: HashMap::new(),
+            gc_mode,
         }
     }
 
@@ -247,10 +252,14 @@ impl<'ctx> Codegen<'ctx> {
 
     fn gen_impl(&mut self, im: &Impl) -> Result<()> {
         for method in &im.methods {
-            // Mangle name: StructName::MethodName
             let mangled_name = format!("{}::{}", im.target, method.name);
             let mut methods_item = method.clone();
             methods_item.name = mangled_name;
+            for (name, ty) in &mut methods_item.params {
+                if name == "self" {
+                    *ty = Type::Custom(im.target.clone());
+                }
+            }
             self.gen_function(methods_item)?;
         }
         Ok(())
@@ -375,6 +384,60 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(ptr, val)?;
                 Ok(())
             }
+            Stmt::IndexAssign(target, index, value) => {
+                let pylist_set_fn = if let Some(f) = self.module.get_function("pylist_set") {
+                    f
+                } else {
+                    let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let fn_type = self.context.void_type().fn_type(
+                        &[
+                            ptr_type.into(),
+                            self.context.i64_type().into(),
+                            ptr_type.into(),
+                        ],
+                        false,
+                    );
+                    self.module.add_function("pylist_set", fn_type, None)
+                };
+
+                let mut list_val = self.gen_expr(target)?;
+                match &self.last_type {
+                    Type::Ref(inner) | Type::MutRef(inner) => {
+                        let inner_ty = inner.as_ref();
+                        list_val = self.builder.build_load(
+                            self.get_llvm_type(inner_ty),
+                            list_val.into_pointer_value(),
+                            "list_ptr_load",
+                        )?;
+                    }
+                    _ => {}
+                }
+
+                let index_val = self.gen_expr(index)?;
+                let val_val = self.gen_expr(value)?;
+
+                // Cast to void* if necessary
+                let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
+                let val_ptr = if val_val.is_pointer_value() {
+                    val_val.into_pointer_value()
+                } else if val_val.is_int_value() {
+                    self.builder.build_int_to_ptr(
+                        val_val.into_int_value(),
+                        ptr_type,
+                        "val_to_ptr",
+                    )?
+                } else {
+                    return Err(anyhow!("Cannot cast value to pointer for list assignment"));
+                };
+
+                self.builder.build_call(
+                    pylist_set_fn,
+                    &[list_val.into(), index_val.into(), val_ptr.into()],
+                    "list_set_call",
+                )?;
+
+                Ok(())
+            }
             Stmt::If(cond, then_body, elif_branches, else_body) => {
                 self.gen_if(cond, then_body, elif_branches, else_body)
             }
@@ -403,6 +466,27 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Ok(())
             }
+            Stmt::MemberAssign(obj, field, value) => {
+                let obj_val = self.gen_expr(obj)?;
+                let ptr = obj_val.into_pointer_value();
+                let struct_name = match &self.last_type {
+                    Type::Custom(name) => name.clone(),
+                    _ => return Err(anyhow!("Cannot assign to field of non-struct type")),
+                };
+                let struct_type = self.struct_types.get(&struct_name)
+                    .ok_or_else(|| anyhow!("Struct type not found for {}", struct_name))?;
+                let metadata = self.struct_metadata.get(&struct_name)
+                    .ok_or_else(|| anyhow!("Metadata not found for struct {}", struct_name))?;
+                let field_idx = metadata.fields.iter()
+                    .position(|f| &f.0 == field)
+                    .ok_or_else(|| anyhow!("Field {} not found in struct {}", field, struct_name))?;
+                let field_ptr = self.builder.build_struct_gep(
+                    *struct_type, ptr, field_idx as u32, field,
+                )?;
+                let val = self.gen_expr(value)?;
+                self.builder.build_store(field_ptr, val)?;
+                Ok(())
+            }
             Stmt::Expr(expr) => {
                 self.gen_expr_stmt(expr)?;
                 Ok(())
@@ -412,6 +496,19 @@ impl<'ctx> Codegen<'ctx> {
 
     fn gen_expr_stmt(&mut self, expr: &Expr) -> Result<()> {
         match expr {
+            Expr::Call(name, args) if name == "print" => {
+                let arg = self.gen_expr(&args[0])?;
+                let helper_name = match &self.last_type {
+                    Type::Int => "pyrs_print_int",
+                    Type::Float => "pyrs_print_float",
+                    Type::Bool => "pyrs_print_bool",
+                    Type::String => "pyrs_print_str",
+                    _ => return Err(anyhow!("Unsupported type for print")),
+                };
+                let fn_val = self.get_or_declare_runtime_fn(helper_name);
+                self.builder.build_call(fn_val, &[arg.into()], "")?;
+                Ok(())
+            }
             Expr::Call(name, args) => {
                 let actual_name = self.fn_name_map.get(name).unwrap_or(name);
                 let fn_val = self
@@ -674,6 +771,32 @@ impl<'ctx> Codegen<'ctx> {
                     .const_float(*f)
                     .as_basic_value_enum())
             }
+            Expr::Borrow(inner, is_mut) => {
+                let ty = self.analyze_expr_type_only(inner)?;
+                let child_ty = ty.clone();
+                let addr = self.gen_address(inner)?;
+                self.last_type = if *is_mut {
+                    Type::MutRef(Box::new(child_ty))
+                } else {
+                    Type::Ref(Box::new(child_ty))
+                };
+                Ok(addr.as_basic_value_enum())
+            }
+            Expr::Deref(inner) => {
+                let ty = self.gen_expr(inner)?;
+                let inner_ty = match &self.last_type {
+                    Type::Ref(t) | Type::MutRef(t) => t.as_ref().clone(),
+                    _ => return Err(anyhow!("Cannot dereference non-reference type")),
+                };
+                let llvm_ty = self.get_llvm_type(&inner_ty);
+                let val = self
+                    .builder
+                    .build_load(llvm_ty, ty.into_pointer_value(), "deref")?;
+                self.last_type = inner_ty;
+                Ok(val)
+            }
+            Expr::List(items) => self.gen_list(items),
+            Expr::Index(target, index) => self.gen_index(target, index),
             Expr::Bool(b) => {
                 self.last_type = Type::Bool;
                 Ok(self
@@ -768,8 +891,6 @@ impl<'ctx> Codegen<'ctx> {
                 }
 
                 let call = self.builder.build_call(fn_val, &llvm_args, "methodtmp")?;
-
-                // For now, we don't have return type info here, so we set it to Void
                 self.last_type = Type::Void;
 
                 match call.try_as_basic_value() {
@@ -778,7 +899,7 @@ impl<'ctx> Codegen<'ctx> {
                         .context
                         .i64_type()
                         .const_int(0, false)
-                        .as_basic_value_enum()), // Default for void
+                        .as_basic_value_enum()),
                 }
             }
             Expr::Var(name) => {
@@ -839,6 +960,20 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             Expr::Call(name, args) => {
+                if name == "print" {
+                    let arg = self.gen_expr(&args[0])?;
+                    let helper_name = match &self.last_type {
+                        Type::Int => "pyrs_print_int",
+                        Type::Float => "pyrs_print_float",
+                        Type::Bool => "pyrs_print_bool",
+                        Type::String => "pyrs_print_str",
+                        _ => return Err(anyhow!("Unsupported type for print")),
+                    };
+                    let fn_val = self.get_or_declare_runtime_fn(helper_name);
+                    self.builder.build_call(fn_val, &[arg.into()], "")?;
+                    self.last_type = Type::Void;
+                    return Ok(self.context.i64_type().const_int(0, false).as_basic_value_enum());
+                }
                 if let Some(st) = self.struct_types.get(name).cloned() {
                     // Constructor
                     let alloca = self.create_entry_block_alloca(
@@ -998,7 +1133,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Int => self.context.i64_type().as_basic_type_enum(),
             Type::Float => self.context.f64_type().as_basic_type_enum(),
             Type::Bool => self.context.bool_type().as_basic_type_enum(),
-            Type::String => self
+            Type::String | Type::List(_) | Type::Ref(_) | Type::MutRef(_) => self
                 .context
                 .ptr_type(inkwell::AddressSpace::from(0))
                 .as_basic_type_enum(),
@@ -1037,5 +1172,203 @@ impl<'ctx> Codegen<'ctx> {
         builder
             .build_alloca(self.get_llvm_type(ty), var_name)
             .unwrap()
+    }
+
+    fn gen_list(&mut self, items: &[Expr]) -> Result<BasicValueEnum<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(inkwell::AddressSpace::from(0));
+
+        // Declare pylist_new if not already there
+        let pylist_new_fn = if let Some(f) = self.module.get_function("pylist_new") {
+            f
+        } else {
+            let fn_type = ptr_type.fn_type(&[i64_type.into()], false);
+            self.module.add_function("pylist_new", fn_type, None)
+        };
+
+        // Declare pylist_append if not already there
+        let pylist_append_fn = if let Some(f) = self.module.get_function("pylist_append") {
+            f
+        } else {
+            let fn_type = self
+                .context
+                .void_type()
+                .fn_type(&[ptr_type.into(), ptr_type.into()], false);
+            self.module.add_function("pylist_append", fn_type, None)
+        };
+
+        // pylist_new(capacity)
+        let call_res = self.builder.build_call(
+            pylist_new_fn,
+            &[i64_type.const_int(items.len() as u64, false).into()],
+            "list_new",
+        )?;
+
+        let list_ptr = match call_res.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(v) => v,
+            _ => panic!("pylist_new returned void"),
+        };
+
+        let mut item_ty = Type::Void;
+        for item_expr in items {
+            let item_val = self.gen_expr(item_expr)?;
+            item_ty = self.last_type.clone();
+
+            // Cast to void* if needed
+            let casted_item = if item_val.is_pointer_value() {
+                item_val
+            } else {
+                self.builder
+                    .build_int_to_ptr(item_val.into_int_value(), ptr_type, "cast")?
+                    .as_basic_value_enum()
+            };
+
+            self.builder.build_call(
+                pylist_append_fn,
+                &[list_ptr.into(), casted_item.into()],
+                "",
+            )?;
+        }
+
+        self.last_type = Type::List(Box::new(item_ty));
+        Ok(list_ptr)
+    }
+
+    fn gen_index(&mut self, target: &Expr, index: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(inkwell::AddressSpace::from(0));
+
+        // Declare pylist_get
+        let pylist_get_fn = if let Some(f) = self.module.get_function("pylist_get") {
+            f
+        } else {
+            let fn_type = ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
+            self.module.add_function("pylist_get", fn_type, None)
+        };
+
+        let mut list_val = self.gen_expr(target)?;
+        let list_inner_ty = match &self.last_type {
+            Type::List(inner) => inner.as_ref().clone(),
+            Type::Ref(inner) | Type::MutRef(inner) => {
+                let inner_ty = inner.as_ref();
+                list_val = self.builder.build_load(
+                    self.get_llvm_type(inner_ty),
+                    list_val.into_pointer_value(),
+                    "list_ptr_load",
+                )?;
+                match inner_ty {
+                    Type::List(ele_ty) => ele_ty.as_ref().clone(),
+                    _ => return Err(anyhow!("Cannot index into non-list type")),
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Cannot index into non-list type {:?}",
+                    self.last_type
+                ));
+            }
+        };
+
+        let index_val = self.gen_expr(index)?;
+
+        let call_res = self.builder.build_call(
+            pylist_get_fn,
+            &[list_val.into(), index_val.into()],
+            "list_get",
+        )?;
+
+        let result_ptr = match call_res.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(v) => v,
+            _ => panic!("pylist_get returned void"),
+        };
+
+        // Cast back from void* to the actual type
+        self.last_type = list_inner_ty;
+        let llvm_ty = self.get_llvm_type(&self.last_type);
+        if llvm_ty.is_pointer_type() {
+            Ok(result_ptr)
+        } else if llvm_ty.is_int_type() {
+            Ok(self
+                .builder
+                .build_ptr_to_int(
+                    result_ptr.into_pointer_value(),
+                    llvm_ty.into_int_type(),
+                    "cast_back",
+                )?
+                .as_basic_value_enum())
+        } else {
+            // Handle other types if necessary (e.g., float)
+            Ok(result_ptr)
+        }
+    }
+
+    fn gen_address(&mut self, expr: &Expr) -> Result<PointerValue<'ctx>> {
+        match expr {
+            Expr::Var(name) => {
+                let (ptr, _) = self
+                    .lookup_variable(name)
+                    .ok_or_else(|| anyhow!("Undefined variable: {}", name))?;
+                Ok(*ptr)
+            }
+            Expr::MemberAccess(target, field_name) => {
+                let target_ptr = self.gen_expr(target)?.into_pointer_value();
+                let struct_name = match &self.last_type {
+                    Type::Custom(name) => name,
+                    _ => return Err(anyhow!("Not a struct")),
+                };
+                let struct_type = self
+                    .struct_types
+                    .get(struct_name)
+                    .ok_or_else(|| anyhow!("Struct type not found"))?;
+                let metadata = self
+                    .struct_metadata
+                    .get(struct_name)
+                    .ok_or_else(|| anyhow!("Metadata not found"))?;
+
+                let field_idx = metadata
+                    .fields
+                    .iter()
+                    .position(|f| &f.0 == field_name)
+                    .ok_or_else(|| anyhow!("Field not found"))?;
+
+                Ok(self.builder.build_struct_gep(
+                    *struct_type,
+                    target_ptr,
+                    field_idx as u32,
+                    field_name,
+                )?)
+            }
+            Expr::Deref(inner) => Ok(self.gen_expr(inner)?.into_pointer_value()),
+            _ => Err(anyhow!("Cannot take address of this expression")),
+        }
+    }
+
+    fn get_or_declare_runtime_fn(&self, name: &str) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(name) {
+            return f;
+        }
+        let i64_type = self.context.i64_type();
+        let f64_type = self.context.f64_type();
+        let bool_type = self.context.bool_type();
+        let ptr_type = self.context.ptr_type(inkwell::AddressSpace::from(0));
+        let void_type = self.context.void_type();
+
+        let fn_type = match name {
+            "pyrs_print_int" => void_type.fn_type(&[i64_type.into()], false),
+            "pyrs_print_float" => void_type.fn_type(&[f64_type.into()], false),
+            "pyrs_print_bool" => void_type.fn_type(&[bool_type.into()], false),
+            "pyrs_print_str" => void_type.fn_type(&[ptr_type.into()], false),
+            "pyrs_alloc" => ptr_type.fn_type(&[i64_type.into()], false),
+            "pyrs_runtime_init" => void_type.fn_type(&[i64_type.into()], false),
+            _ => panic!("Unknown runtime function: {}", name),
+        };
+        self.module.add_function(name, fn_type, None)
+    }
+
+    fn analyze_expr_type_only(&self, _expr: &Expr) -> Result<Type> {
+        // Limited type extraction for codegen.
+        // In a more robust compiler, we'd have a map of Expr -> Type from the analyzer.
+        // For now, we'll return Type::Void as a placeholder if we can't determine it easily.
+        Ok(Type::Void)
     }
 }

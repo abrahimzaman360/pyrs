@@ -1,0 +1,18 @@
+extern printf(format: str, ...) -> int;
+
+def test_shared(y: &list[int]):
+    printf("z[1]: %ld\n", y[1]);
+
+def test_mut(w: &mut list[int]):
+    w[2] = 300;
+    printf("w[2]: %ld\n", w[2]);
+
+def main() -> int:
+    let x: list[int] = [1, 2, 3];
+    let y: list[int] = x; # Move
+    printf("y[0]: %ld\n", y[0]);
+    
+    test_shared(&y);
+    test_mut(&mut y);
+    
+    return 0;

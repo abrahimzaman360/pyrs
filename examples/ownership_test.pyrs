@@ -1,0 +1,27 @@
+extern printf(format: str, ...) -> int;
+
+def test_move():
+    let x: list[int] = [1, 2, 3];
+    let y: list[int] = x;  # x is moved to y
+    printf("Move successful: y[0] = %ld\n", y[0]);
+    # printf("x[0]: %ld\n", x[0]); # Error: Use of moved value
+
+def test_shared_borrow():
+    let y: list[int] = [10, 20, 30];
+    let z: &list[int] = &y;
+    let a: &list[int] = &y; # Multiple shared borrows allowed
+    printf("Shared borrows: z[1]=%ld, a[1]=%ld\n", z[1], a[1]);
+
+def test_mut_borrow():
+    let y: list[int] = [100, 200, 300];
+    let w: &mut list[int] = &mut y;
+    printf("Mut borrow: w[2]=%ld\n", w[2]);
+    # let z: &list[int] = &y; # Error: Already borrowed as mutable
+
+def main() -> int:
+    printf("Starting Ownership Tests...\n", 0);
+    test_move();
+    test_shared_borrow();
+    test_mut_borrow();
+    printf("All Tests Passed!\n", 0);
+    return 0;

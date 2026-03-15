@@ -1,41 +1,37 @@
 use std::process::Command;
 
-fn run_pyrs(input: &str, output: &str) -> i32 {
-    // Build and run using the 'run' command
-    // We ignore the output and run the binary ourselves to get the exit code easily
-    let status = Command::new("cargo")
-        .args(&["run", "--", "run", input, "--output", output])
-        .status()
-        .expect("Failed to execute cargo run");
-    
-    if !status.success() {
-        panic!("pyrs run failed for {}", input);
-    }
+fn compile_and_run(input: &str, output: &str) -> i32 {
+    let pyrs_bin = env!("CARGO_BIN_EXE_pyrs");
 
-    let bin_path = format!("bin/{}", output);
-    let run_status = Command::new(format!("./{}", bin_path))
+    let status = Command::new(pyrs_bin)
+        .args(["run", input, "-o", output, "--gc", "off"])
         .status()
-        .expect("Failed to execute compiled binary");
-    
-    run_status.code().unwrap_or(-1)
+        .expect("Failed to execute pyrs");
+
+    status.code().unwrap_or(-1)
 }
 
 #[test]
 fn test_fibonacci() {
-    assert_eq!(run_pyrs("examples/fibonacci.pyrs", "test_fib"), 55);
+    assert_eq!(compile_and_run("examples/fibonacci.pyrs", "test_fib"), 55);
 }
 
 #[test]
 fn test_factorial() {
-    assert_eq!(run_pyrs("examples/factorial.pyrs", "test_fact"), 120);
+    assert_eq!(compile_and_run("examples/factorial.pyrs", "test_fact"), 120);
 }
 
 #[test]
 fn test_loop() {
-    assert_eq!(run_pyrs("examples/loop.pyrs", "test_loop"), 45);
+    assert_eq!(compile_and_run("examples/loop.pyrs", "test_loop"), 45);
 }
 
 #[test]
 fn test_logic() {
-    assert_eq!(run_pyrs("examples/logic.pyrs", "test_logic"), 1);
+    assert_eq!(compile_and_run("examples/logic.pyrs", "test_logic"), 1);
+}
+
+#[test]
+fn test_extern() {
+    assert_eq!(compile_and_run("examples/extern_demo.pyrs", "test_extern"), 0);
 }

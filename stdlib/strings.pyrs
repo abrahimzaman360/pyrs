@@ -1,0 +1,11 @@
+extern pyrs_str_len(s: str) -> int;
+extern pyrs_str_eq(a: str, b: str) -> int;
+
+def len(s: str) -> int:
+    return pyrs_str_len(s);
+
+def eq(a: str, b: str) -> bool:
+    return pyrs_str_eq(a, b) != 0;
+
+def is_empty(s: str) -> bool:
+    return len(s) == 0;

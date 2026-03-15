@@ -1,0 +1,8 @@
+extern printf(format: str, ...) -> int;
+
+def main() -> int:
+    let y: list[int] = [1, 2, 3];
+    let z: &list[int] = &y;
+    let w: &mut list[int] = &mut y; # Error: Already borrowed
+    printf("z[0]: %ld\n", z[0]);
+    return 0;

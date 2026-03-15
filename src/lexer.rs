@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\f]+")] // Skip inline whitespace except newlines
-#[logos(skip(r"//[^\n]*", allow_greedy = true))] // Skip comments
+#[logos(skip(r"(#|//)[^\n]*", allow_greedy = true))] // Skip comments
 pub enum RawToken {
     #[token("def")]
     Def,
@@ -37,6 +37,12 @@ pub enum RawToken {
     Or,
     #[token("not")]
     Not,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
+    #[token("&")]
+    Ampersand,
     #[token("->")]
     Arrow,
     #[token("import")]
@@ -51,6 +57,8 @@ pub enum RawToken {
     Dot,
     #[token("struct")]
     Struct,
+    #[token("mut")]
+    Mut,
     #[token("impl")]
     Impl,
     #[token("trait")]
@@ -145,6 +153,7 @@ pub enum Token {
     As,
     Dot,
     Struct,
+    Mut,
     Impl,
     Trait,
     Match,
@@ -157,6 +166,9 @@ pub enum Token {
     Bool(bool),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    Ampersand,
     Colon,
     Comma,
     Semicolon,
@@ -201,6 +213,9 @@ impl From<RawToken> for Token {
             RawToken::And => Token::And,
             RawToken::Or => Token::Or,
             RawToken::Not => Token::Not,
+            RawToken::LBracket => Token::LBracket,
+            RawToken::RBracket => Token::RBracket,
+            RawToken::Ampersand => Token::Ampersand,
             RawToken::Arrow => Token::Arrow,
             RawToken::Import => Token::Import,
             RawToken::From => Token::From,
@@ -208,6 +223,7 @@ impl From<RawToken> for Token {
             RawToken::Dot => Token::Dot,
             RawToken::Ellipsis => Token::Ellipsis,
             RawToken::Struct => Token::Struct,
+            RawToken::Mut => Token::Mut,
             RawToken::Impl => Token::Impl,
             RawToken::Trait => Token::Trait,
             RawToken::Match => Token::Match,
@@ -289,7 +305,7 @@ impl<'a> Lexer<'a> {
 
         // Check for comment-only line
         let remaining = &remainder[bytes_to_skip..];
-        if remaining.starts_with("//") {
+        if remaining.starts_with('#') || remaining.starts_with("//") {
             let line_end = remaining
                 .find('\n')
                 .map(|p| p + 1)

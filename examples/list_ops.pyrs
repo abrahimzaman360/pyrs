@@ -1,0 +1,20 @@
+extern printf(format: str, ...) -> int;
+
+def main() -> int:
+    let l: list[int] = [1, 2, 3];
+    printf("Initial len: %ld\n", 3); # We don't have list.len() yet as a method, but we can test get/set
+    
+    printf("l[0]: %ld\n", l[0]);
+    printf("l[1]: %ld\n", l[1]);
+    printf("l[2]: %ld\n", l[2]);
+    
+    l[0] = 10;
+    l[1] = 20;
+    l[2] = 30;
+    
+    printf("After set:\n", 0);
+    printf("l[0]: %ld\n", l[0]);
+    printf("l[1]: %ld\n", l[1]);
+    printf("l[2]: %ld\n", l[2]);
+    
+    return 0;

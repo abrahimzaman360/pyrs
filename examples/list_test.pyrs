@@ -1,0 +1,13 @@
+extern printf(format: str, ...) -> int;
+
+def main() -> int:
+    let my_list: list[int] = [10, 20, 30];
+    let first: int = my_list[0];
+    let second: int = my_list[1];
+    let third: int = my_list[2];
+    
+    printf("First: %ld\n", first);
+    printf("Second: %ld\n", second);
+    printf("Third: %ld\n", third);
+    
+    return 0;
