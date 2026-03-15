@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 pub struct SymbolTable {
-    scopes: Vec<HashMap<String, Type>>,
+    scopes: Vec<HashMap<String, (Type, bool)>>, // (type, initialized)
 }
 
 impl SymbolTable {
@@ -21,22 +21,31 @@ impl SymbolTable {
         self.scopes.pop();
     }
 
-    pub fn insert(&mut self, name: String, ty: Type) -> Result<()> {
+    pub fn insert(&mut self, name: String, ty: Type, initialized: bool) -> Result<()> {
         if let Some(scope) = self.scopes.last_mut() {
             if scope.contains_key(&name) {
                 return Err(anyhow!("Variable '{}' already defined in this scope", name));
             }
-            scope.insert(name, ty);
+            scope.insert(name, (ty, initialized));
             Ok(())
         } else {
             Err(anyhow!("No active scope"))
         }
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&Type> {
+    pub fn mark_initialized(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(entry) = scope.get_mut(name) {
+                entry.1 = true;
+                return;
+            }
+        }
+    }
+
+    pub fn lookup(&self, name: &str) -> Option<&(Type, bool)> {
         for scope in self.scopes.iter().rev() {
-            if let Some(ty) = scope.get(name) {
-                return Some(ty);
+            if let Some(entry) = scope.get(name) {
+                return Some(entry);
             }
         }
         None
@@ -46,6 +55,7 @@ impl SymbolTable {
 pub struct Analyzer {
     symbols: SymbolTable,
     functions: HashMap<String, (Vec<Type>, Type)>,
+    in_loop: bool,
 }
 
 impl Analyzer {
@@ -53,6 +63,7 @@ impl Analyzer {
         Self {
             symbols: SymbolTable::new(),
             functions: HashMap::new(),
+            in_loop: false,
         }
     }
 
@@ -76,6 +87,9 @@ impl Analyzer {
                     self.functions
                         .insert(e.name.clone(), (param_types, e.return_type.clone()));
                 }
+                TopLevel::Import(_) | TopLevel::FromImport(_) => {
+                    // Imports are not yet implemented; silently ignore for now
+                }
             }
         }
 
@@ -92,20 +106,51 @@ impl Analyzer {
     fn analyze_function(&mut self, f: &Function) -> Result<()> {
         self.symbols.push_scope();
         for (name, ty) in &f.params {
-            self.symbols.insert(name.clone(), ty.clone())?;
+            self.symbols.insert(name.clone(), ty.clone(), true)?;
         }
 
         for stmt in &f.body {
             self.analyze_stmt(stmt, &f.return_type)?;
         }
 
+        // Verify all paths return for non-void functions
+        if f.return_type != Type::Void && !self.block_always_returns(&f.body) {
+            return Err(anyhow!(
+                "Function '{}' does not return a value on all paths",
+                f.name
+            ));
+        }
+
         self.symbols.pop_scope();
         Ok(())
+    }
+
+    fn block_always_returns(&self, stmts: &[Stmt]) -> bool {
+        if let Some(last) = stmts.last() {
+            match last {
+                Stmt::Return(_) => true,
+                Stmt::If(_, then_body, elif_branches, else_body) => {
+                    let then_returns = self.block_always_returns(then_body);
+                    let elifs_return = elif_branches
+                        .iter()
+                        .all(|(_, body)| self.block_always_returns(body));
+                    let else_returns = else_body
+                        .as_ref()
+                        .map(|b| self.block_always_returns(b))
+                        .unwrap_or(false);
+                    then_returns && elifs_return && else_returns
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt, ret_ty: &Type) -> Result<()> {
         match stmt {
             Stmt::Let(name, ty, value) => {
+                let initialized = value.is_some();
                 if let Some(expr) = value {
                     let val_ty = self.analyze_expr(expr)?;
                     if val_ty != *ty {
@@ -117,14 +162,14 @@ impl Analyzer {
                         ));
                     }
                 }
-                self.symbols.insert(name.clone(), ty.clone())?;
+                self.symbols.insert(name.clone(), ty.clone(), initialized)?;
             }
             Stmt::Assign(name, expr) => {
-                let var_ty = self
+                let entry = self
                     .symbols
                     .lookup(name)
-                    .cloned()
                     .ok_or_else(|| anyhow!("Undefined variable: '{}'", name))?;
+                let var_ty = entry.0.clone();
                 let val_ty = self.analyze_expr(expr)?;
                 if var_ty != val_ty {
                     return Err(anyhow!(
@@ -134,8 +179,9 @@ impl Analyzer {
                         val_ty
                     ));
                 }
+                self.symbols.mark_initialized(name);
             }
-            Stmt::If(cond, then_body, else_body) => {
+            Stmt::If(cond, then_body, elif_branches, else_body) => {
                 let cond_ty = self.analyze_expr(cond)?;
                 if cond_ty != Type::Bool {
                     return Err(anyhow!(
@@ -144,6 +190,16 @@ impl Analyzer {
                     ));
                 }
                 self.analyze_block(then_body, ret_ty)?;
+                for (elif_cond, elif_body) in elif_branches {
+                    let elif_ty = self.analyze_expr(elif_cond)?;
+                    if elif_ty != Type::Bool {
+                        return Err(anyhow!(
+                            "Condition of 'elif' must be bool, found {:?}",
+                            elif_ty
+                        ));
+                    }
+                    self.analyze_block(elif_body, ret_ty)?;
+                }
                 if let Some(else_b) = else_body {
                     self.analyze_block(else_b, ret_ty)?;
                 }
@@ -156,7 +212,51 @@ impl Analyzer {
                         cond_ty
                     ));
                 }
+                let prev_in_loop = self.in_loop;
+                self.in_loop = true;
                 self.analyze_block(body, ret_ty)?;
+                self.in_loop = prev_in_loop;
+            }
+            Stmt::For(var_name, start, end, step, body) => {
+                let start_ty = self.analyze_expr(start)?;
+                let end_ty = self.analyze_expr(end)?;
+                if start_ty != Type::Int {
+                    return Err(anyhow!(
+                        "For loop start must be int, found {:?}",
+                        start_ty
+                    ));
+                }
+                if end_ty != Type::Int {
+                    return Err(anyhow!("For loop end must be int, found {:?}", end_ty));
+                }
+                if let Some(s) = step {
+                    let step_ty = self.analyze_expr(s)?;
+                    if step_ty != Type::Int {
+                        return Err(anyhow!(
+                            "For loop step must be int, found {:?}",
+                            step_ty
+                        ));
+                    }
+                }
+                self.symbols.push_scope();
+                self.symbols.insert(var_name.clone(), Type::Int, true)?;
+                let prev_in_loop = self.in_loop;
+                self.in_loop = true;
+                for stmt in body {
+                    self.analyze_stmt(stmt, ret_ty)?;
+                }
+                self.in_loop = prev_in_loop;
+                self.symbols.pop_scope();
+            }
+            Stmt::Break => {
+                if !self.in_loop {
+                    return Err(anyhow!("'break' outside of loop"));
+                }
+            }
+            Stmt::Continue => {
+                if !self.in_loop {
+                    return Err(anyhow!("'continue' outside of loop"));
+                }
             }
             Stmt::Return(value) => {
                 let actual_ty = if let Some(expr) = value {
@@ -194,11 +294,19 @@ impl Analyzer {
             Expr::Float(_) => Ok(Type::Float),
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::String(_) => Ok(Type::String),
-            Expr::Var(name) => self
-                .symbols
-                .lookup(name)
-                .cloned()
-                .ok_or_else(|| anyhow!("Undefined variable: '{}'", name)),
+            Expr::Var(name) => {
+                let entry = self
+                    .symbols
+                    .lookup(name)
+                    .ok_or_else(|| anyhow!("Undefined variable: '{}'", name))?;
+                if !entry.1 {
+                    return Err(anyhow!(
+                        "Variable '{}' used before initialization",
+                        name
+                    ));
+                }
+                Ok(entry.0.clone())
+            }
             Expr::Binary(lhs, op, rhs) => {
                 let lt = self.analyze_expr(lhs)?;
                 let rt = self.analyze_expr(rhs)?;
@@ -211,13 +319,36 @@ impl Analyzer {
                     ));
                 }
                 match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => Ok(lt),
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Gt
-                    | BinaryOp::Le
-                    | BinaryOp::Ge => Ok(Type::Bool),
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                        if lt != Type::Int && lt != Type::Float {
+                            return Err(anyhow!(
+                                "Arithmetic operator {:?} requires numeric operands, found {:?}",
+                                op,
+                                lt
+                            ));
+                        }
+                        Ok(lt)
+                    }
+                    BinaryOp::Mod => {
+                        if lt != Type::Int {
+                            return Err(anyhow!(
+                                "Modulo operator requires int operands, found {:?}",
+                                lt
+                            ));
+                        }
+                        Ok(Type::Int)
+                    }
+                    BinaryOp::Eq | BinaryOp::Ne => Ok(Type::Bool),
+                    BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+                        if lt != Type::Int && lt != Type::Float {
+                            return Err(anyhow!(
+                                "Comparison operator {:?} requires numeric operands, found {:?}",
+                                op,
+                                lt
+                            ));
+                        }
+                        Ok(Type::Bool)
+                    }
                     BinaryOp::And | BinaryOp::Or => {
                         if lt != Type::Bool {
                             return Err(anyhow!(

@@ -16,7 +16,7 @@ impl<'a> Parser<'a> {
             peek_token: None,
         };
         p.advance();
-        p.advance(); // Fill both current and peek
+        p.advance();
         p
     }
 
@@ -44,10 +44,27 @@ impl<'a> Parser<'a> {
         self.peek_token.as_ref()
     }
 
+    fn skip_newlines(&mut self) {
+        while self.peek() == Some(&Token::Newline) {
+            self.advance();
+        }
+    }
+
+    fn expect_semicolon(&mut self) -> Result<()> {
+        self.expect(Token::Semicolon)?;
+        // Accept Newline, Dedent, or EOF after semicolon
+        if self.peek() == Some(&Token::Newline) {
+            self.advance();
+        }
+        Ok(())
+    }
+
     pub fn parse_program(&mut self) -> Result<Program> {
         let mut items = Vec::new();
+        self.skip_newlines();
         while self.peek().is_some() {
             items.push(self.parse_top_level()?);
+            self.skip_newlines();
         }
         Ok(Program { items })
     }
@@ -56,6 +73,8 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::Def) => Ok(TopLevel::Function(self.parse_function()?)),
             Some(Token::Extern) => Ok(TopLevel::Extern(self.parse_extern()?)),
+            Some(Token::Import) => Ok(TopLevel::Import(self.parse_import()?)),
+            Some(Token::From) => Ok(TopLevel::FromImport(self.parse_from_import()?)),
             Some(Token::Newline) => {
                 self.advance();
                 self.parse_top_level()
@@ -110,7 +129,7 @@ impl<'a> Parser<'a> {
             body,
         })
     }
-    
+
     fn parse_extern(&mut self) -> Result<ExternDecl> {
         self.expect(Token::Extern)?;
         self.expect(Token::Def)?;
@@ -146,14 +165,73 @@ impl<'a> Parser<'a> {
             return_type = self.parse_type()?;
         }
 
-        self.expect(Token::Semicolon)?;
-        self.expect(Token::Newline)?;
+        self.expect_semicolon()?;
 
         Ok(ExternDecl {
             name,
             params,
             return_type,
         })
+    }
+
+    fn parse_import(&mut self) -> Result<Import> {
+        self.expect(Token::Import)?;
+        let path = self.parse_module_path()?;
+        let mut alias = None;
+        if self.peek() == Some(&Token::As) {
+            self.advance();
+            alias = Some(match self.advance_with_token() {
+                Some(Token::Ident(s)) => s,
+                _ => return Err(anyhow!("Expected identifier after 'as'")),
+            });
+        }
+        self.expect_semicolon()?;
+        Ok(Import { path, alias })
+    }
+
+    fn parse_from_import(&mut self) -> Result<FromImport> {
+        self.expect(Token::From)?;
+        let module_path = self.parse_module_path()?;
+        self.expect(Token::Import)?;
+        let mut names = Vec::new();
+        loop {
+            let name = match self.advance_with_token() {
+                Some(Token::Ident(s)) => s,
+                _ => return Err(anyhow!("Expected identifier in import list")),
+            };
+            let mut alias = None;
+            if self.peek() == Some(&Token::As) {
+                self.advance();
+                alias = Some(match self.advance_with_token() {
+                    Some(Token::Ident(s)) => s,
+                    _ => return Err(anyhow!("Expected identifier after 'as'")),
+                });
+            }
+            names.push((name, alias));
+            if self.peek() == Some(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect_semicolon()?;
+        Ok(FromImport { module_path, names })
+    }
+
+    fn parse_module_path(&mut self) -> Result<Vec<String>> {
+        let mut path = Vec::new();
+        path.push(match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected module identifier")),
+        });
+        while self.peek() == Some(&Token::Dot) {
+            self.advance();
+            path.push(match self.advance_with_token() {
+                Some(Token::Ident(s)) => s,
+                _ => return Err(anyhow!("Expected identifier after '.'")),
+            });
+        }
+        Ok(path)
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
@@ -175,20 +253,64 @@ impl<'a> Parser<'a> {
             Some(Token::Let) => self.parse_let_stmt(),
             Some(Token::If) => self.parse_if_stmt(),
             Some(Token::While) => self.parse_while_stmt(),
+            Some(Token::For) => self.parse_for_stmt(),
             Some(Token::Return) => self.parse_return_stmt(),
-            Some(Token::Ident(s)) if self.peek_ahead() == Some(&Token::Assign) => {
-                let name = s.clone();
-                self.advance(); // identifier
-                self.expect(Token::Assign)?;
-                let expr = self.parse_expr()?;
-                self.expect(Token::Semicolon)?;
-                self.expect(Token::Newline)?;
-                Ok(Stmt::Assign(name, expr))
+            Some(Token::Break) => {
+                self.advance();
+                self.expect_semicolon()?;
+                Ok(Stmt::Break)
+            }
+            Some(Token::Continue) => {
+                self.advance();
+                self.expect_semicolon()?;
+                Ok(Stmt::Continue)
+            }
+            Some(Token::Ident(_)) => {
+                // Check for assignment or augmented assignment
+                match self.peek_ahead() {
+                    Some(Token::Assign) => {
+                        let name = match self.advance_with_token() {
+                            Some(Token::Ident(s)) => s,
+                            _ => unreachable!(),
+                        };
+                        self.expect(Token::Assign)?;
+                        let expr = self.parse_expr()?;
+                        self.expect_semicolon()?;
+                        Ok(Stmt::Assign(name, expr))
+                    }
+                    Some(Token::PlusAssign)
+                    | Some(Token::MinusAssign)
+                    | Some(Token::StarAssign)
+                    | Some(Token::SlashAssign) => {
+                        let name = match self.advance_with_token() {
+                            Some(Token::Ident(s)) => s,
+                            _ => unreachable!(),
+                        };
+                        let op = match self.advance_with_token() {
+                            Some(Token::PlusAssign) => BinaryOp::Add,
+                            Some(Token::MinusAssign) => BinaryOp::Sub,
+                            Some(Token::StarAssign) => BinaryOp::Mul,
+                            Some(Token::SlashAssign) => BinaryOp::Div,
+                            _ => unreachable!(),
+                        };
+                        let rhs = self.parse_expr()?;
+                        self.expect_semicolon()?;
+                        // Desugar: x += y => x = x + y
+                        Ok(Stmt::Assign(
+                            name.clone(),
+                            Expr::Binary(Box::new(Expr::Var(name)), op, Box::new(rhs)),
+                        ))
+                    }
+                    _ => {
+                        let expr = self.parse_expr()?;
+                        self.expect_semicolon()?;
+                        Ok(Stmt::Expr(expr))
+                    }
+                }
             }
             _ => {
                 let expr = self.parse_expr()?;
-                self.expect(Token::Semicolon)?;
-                self.expect(Token::Newline)?;
+                self.expect_semicolon()?;
                 Ok(Stmt::Expr(expr))
             }
         }
@@ -207,17 +329,28 @@ impl<'a> Parser<'a> {
             self.advance();
             value = Some(self.parse_expr()?);
         }
-        self.expect(Token::Semicolon)?;
-        self.expect(Token::Newline)?;
+        self.expect_semicolon()?;
         Ok(Stmt::Let(name, ty, value))
     }
 
     fn parse_if_stmt(&mut self) -> Result<Stmt> {
-        self.advance();
+        self.advance(); // consume 'if'
         let cond = self.parse_expr()?;
         self.expect(Token::Colon)?;
         self.expect(Token::Newline)?;
         let then_branch = self.parse_block()?;
+
+        // Parse elif chains
+        let mut elif_branches = Vec::new();
+        while self.peek() == Some(&Token::Elif) {
+            self.advance(); // consume 'elif'
+            let elif_cond = self.parse_expr()?;
+            self.expect(Token::Colon)?;
+            self.expect(Token::Newline)?;
+            let elif_body = self.parse_block()?;
+            elif_branches.push((elif_cond, elif_body));
+        }
+
         let mut else_branch = None;
         if self.peek() == Some(&Token::Else) {
             self.advance();
@@ -225,7 +358,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::Newline)?;
             else_branch = Some(self.parse_block()?);
         }
-        Ok(Stmt::If(cond, then_branch, else_branch))
+        Ok(Stmt::If(cond, then_branch, elif_branches, else_branch))
     }
 
     fn parse_while_stmt(&mut self) -> Result<Stmt> {
@@ -237,14 +370,42 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While(cond, body))
     }
 
+    fn parse_for_stmt(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'for'
+        let var_name = match self.advance_with_token() {
+            Some(Token::Ident(s)) => s,
+            _ => return Err(anyhow!("Expected loop variable name after 'for'")),
+        };
+        self.expect(Token::In)?;
+        self.expect(Token::Range)?;
+        self.expect(Token::LParen)?;
+
+        let start = self.parse_expr()?;
+        self.expect(Token::Comma)?;
+        let end = self.parse_expr()?;
+
+        let step = if self.peek() == Some(&Token::Comma) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        self.expect(Token::RParen)?;
+        self.expect(Token::Colon)?;
+        self.expect(Token::Newline)?;
+        let body = self.parse_block()?;
+
+        Ok(Stmt::For(var_name, start, end, step, body))
+    }
+
     fn parse_return_stmt(&mut self) -> Result<Stmt> {
         self.advance();
         let mut value = None;
         if self.peek() != Some(&Token::Semicolon) {
             value = Some(self.parse_expr()?);
         }
-        self.expect(Token::Semicolon)?;
-        self.expect(Token::Newline)?;
+        self.expect_semicolon()?;
         Ok(Stmt::Return(value))
     }
 
@@ -320,10 +481,11 @@ impl<'a> Parser<'a> {
 
     fn parse_factor(&mut self) -> Result<Expr> {
         let mut expr = self.parse_unary()?;
-        while let Some(Token::Star) | Some(Token::Slash) = self.peek() {
+        while let Some(Token::Star) | Some(Token::Slash) | Some(Token::Percent) = self.peek() {
             let op = match self.advance_with_token().unwrap() {
                 Token::Star => BinaryOp::Mul,
                 Token::Slash => BinaryOp::Div,
+                Token::Percent => BinaryOp::Mod,
                 _ => unreachable!(),
             };
             let right = self.parse_unary()?;
@@ -379,19 +541,23 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
-            Some(t) => Err(anyhow!("Unexpected token in primary expr: {:?}", t)),
-            None => Err(anyhow!("Unexpected EOF in primary expr")),
+            Some(t) => Err(anyhow!("Unexpected token in expression: {:?}", t)),
+            None => Err(anyhow!("Unexpected EOF in expression")),
         }
     }
 
     fn parse_type(&mut self) -> Result<Type> {
         match self.advance_with_token() {
             Some(Token::Ident(s)) => match s.as_str() {
-                "i32" | "int" => Ok(Type::Int),
+                "i64" | "int" => Ok(Type::Int),
                 "f64" | "float" => Ok(Type::Float),
                 "bool" => Ok(Type::Bool),
                 "str" | "string" => Ok(Type::String),
-                _ => Ok(Type::Custom(s)),
+                "void" => Ok(Type::Void),
+                other => Err(anyhow!(
+                    "Unknown type '{}'. Supported types: int, float, bool, str, void",
+                    other
+                )),
             },
             _ => Err(anyhow!("Expected type name")),
         }

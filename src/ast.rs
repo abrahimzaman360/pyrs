@@ -5,7 +5,6 @@ pub enum Type {
     Bool,
     String,
     Void,
-    Custom(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +13,7 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
     Eq,
     Ne,
     Lt,
@@ -46,8 +46,13 @@ pub enum Expr {
 pub enum Stmt {
     Let(String, Type, Option<Expr>),
     Assign(String, Expr),
-    If(Expr, Vec<Stmt>, Option<Vec<Stmt>>),
+    If(Expr, Vec<Stmt>, Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
+    // If(condition, then_body, elif_branches: Vec<(condition, body)>, else_body)
     While(Expr, Vec<Stmt>),
+    For(String, Expr, Expr, Option<Expr>, Vec<Stmt>),
+    // For(var_name, start, end, step, body) - for i in range(start, end[, step])
+    Break,
+    Continue,
     Return(Option<Expr>),
     Expr(Expr),
 }
@@ -64,6 +69,20 @@ pub struct Function {
 pub enum TopLevel {
     Function(Function),
     Extern(ExternDecl),
+    Import(Import),
+    FromImport(FromImport),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    pub path: Vec<String>,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromImport {
+    pub module_path: Vec<String>,
+    pub names: Vec<(String, Option<String>)>, // name, alias
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -17,10 +17,20 @@ pub enum RawToken {
     Else,
     #[token("while")]
     While,
+    #[token("elif")]
+    Elif,
+    #[token("for")]
+    For,
+    #[token("in")]
+    In,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
+    #[token("range")]
+    Range,
     #[token("return")]
     Return,
-    #[token("class")]
-    Class,
     #[token("and")]
     And,
     #[token("or")]
@@ -29,6 +39,14 @@ pub enum RawToken {
     Not,
     #[token("->")]
     Arrow,
+    #[token("import")]
+    Import,
+    #[token("from")]
+    From,
+    #[token("as")]
+    As,
+    #[token(".")]
+    Dot,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
@@ -54,6 +72,14 @@ pub enum RawToken {
     #[token(";")]
     Semicolon,
 
+    #[token("+=")]
+    PlusAssign,
+    #[token("-=")]
+    MinusAssign,
+    #[token("*=")]
+    StarAssign,
+    #[token("/=")]
+    SlashAssign,
     #[token("+")]
     Plus,
     #[token("-")]
@@ -62,10 +88,12 @@ pub enum RawToken {
     Star,
     #[token("/")]
     Slash,
-    #[token("=")]
-    Assign,
+    #[token("%")]
+    Percent,
     #[token("==")]
     Eq,
+    #[token("=")]
+    Assign,
     #[token("!=")]
     Ne,
     #[token("<")]
@@ -77,7 +105,7 @@ pub enum RawToken {
     #[token(">=")]
     Ge,
 
-    #[token("\n")]
+    #[regex(r"\r?\n")]
     Newline,
 }
 
@@ -89,12 +117,21 @@ pub enum Token {
     If,
     Else,
     While,
+    Elif,
+    For,
+    In,
+    Break,
+    Continue,
+    Range,
     Return,
-    Class,
     And,
     Or,
     Not,
     Arrow,
+    Import,
+    From,
+    As,
+    Dot,
     Ident(String),
     Int(i64),
     Float(f64),
@@ -105,12 +142,17 @@ pub enum Token {
     Colon,
     Comma,
     Semicolon,
+    PlusAssign,
+    MinusAssign,
+    StarAssign,
+    SlashAssign,
     Plus,
     Minus,
     Star,
     Slash,
-    Assign,
+    Percent,
     Eq,
+    Assign,
     Ne,
     Lt,
     Gt,
@@ -131,12 +173,21 @@ impl From<RawToken> for Token {
             RawToken::If => Token::If,
             RawToken::Else => Token::Else,
             RawToken::While => Token::While,
+            RawToken::Elif => Token::Elif,
+            RawToken::For => Token::For,
+            RawToken::In => Token::In,
+            RawToken::Break => Token::Break,
+            RawToken::Continue => Token::Continue,
+            RawToken::Range => Token::Range,
             RawToken::Return => Token::Return,
-            RawToken::Class => Token::Class,
             RawToken::And => Token::And,
             RawToken::Or => Token::Or,
             RawToken::Not => Token::Not,
             RawToken::Arrow => Token::Arrow,
+            RawToken::Import => Token::Import,
+            RawToken::From => Token::From,
+            RawToken::As => Token::As,
+            RawToken::Dot => Token::Dot,
             RawToken::Ident(s) => Token::Ident(s),
             RawToken::Int(i) => Token::Int(i),
             RawToken::Float(f) => Token::Float(f),
@@ -147,12 +198,17 @@ impl From<RawToken> for Token {
             RawToken::Colon => Token::Colon,
             RawToken::Comma => Token::Comma,
             RawToken::Semicolon => Token::Semicolon,
+            RawToken::PlusAssign => Token::PlusAssign,
+            RawToken::MinusAssign => Token::MinusAssign,
+            RawToken::StarAssign => Token::StarAssign,
+            RawToken::SlashAssign => Token::SlashAssign,
             RawToken::Plus => Token::Plus,
             RawToken::Minus => Token::Minus,
             RawToken::Star => Token::Star,
             RawToken::Slash => Token::Slash,
-            RawToken::Assign => Token::Assign,
+            RawToken::Percent => Token::Percent,
             RawToken::Eq => Token::Eq,
+            RawToken::Assign => Token::Assign,
             RawToken::Ne => Token::Ne,
             RawToken::Lt => Token::Lt,
             RawToken::Gt => Token::Gt,
@@ -207,6 +263,14 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // Check for comment-only line
+        let remaining = &remainder[bytes_to_skip..];
+        if remaining.starts_with("//") {
+            let line_end = remaining.find('\n').map(|p| p + 1).unwrap_or(remaining.len());
+            self.inner.bump(bytes_to_skip + line_end);
+            return true;
+        }
+
         self.inner.bump(bytes_to_skip);
 
         let current_indent = *self.indent_stack.last().unwrap();
@@ -217,6 +281,9 @@ impl<'a> Lexer<'a> {
             while indentation < *self.indent_stack.last().unwrap() {
                 self.indent_stack.pop();
                 self.pending_tokens.push_back(Token::Dedent);
+            }
+            if indentation != *self.indent_stack.last().unwrap() {
+                self.pending_tokens.push_back(Token::Error);
             }
         }
         false
